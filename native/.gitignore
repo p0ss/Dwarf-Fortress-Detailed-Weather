@@ -1,0 +1,7 @@
+# built libraries
+*.so
+*.dll
+*.obj
+*.o
+*.exp
+*.lib

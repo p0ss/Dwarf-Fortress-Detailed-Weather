@@ -388,15 +388,20 @@
 //   * a file named detailed_weather_hook.disable in DF's folder stops it;
 //   * the original slot goes back at shutdown.
 //
-// BUILD (x64 Native Tools Command Prompt for VS 2022, in this folder):
-//   cl /nologo /O2 /EHsc /MD /LD detailed_weather_dll.cpp /Fe:dfhooks_detailed_weather.dll
-// INSTALL: copy dfhooks_detailed_weather.dll into DF's folder (beside the
-// exe). It does nothing until native.lua turns it on.
+// BUILD, in this folder:
+//   Windows (x64 Native Tools Command Prompt for VS 2022):
+//     cl /nologo /O2 /EHsc /MD /LD detailed_weather_hook.cpp /Fe:dfhooks_detailed_weather.dll
+//   Linux:
+//     g++ -std=c++17 -O2 -shared -fPIC -fvisibility=hidden detailed_weather_hook.cpp -ldl -o libdfhooks_detailed_weather.so
+// What differs between the two is in platform.h and its two files; the rest is the same source.
+//
+// INSTALL: copy the library into DF's folder (beside the exe; on Linux,
+// beside libdfhooks.so). It does nothing until native.lua turns it on.
 // =====================================================================
 
-#include <algorithm>   // (std::sort: THE SPATTER DRAWN HERE, the blades; before windows.h, whose min and max macros
-                       //  would otherwise break its declarations)
-#include <windows.h>
+#include <algorithm>   // (std::sort: THE SPATTER DRAWN HERE, the blades; before platform.h, as on Windows it
+                       //  brings in windows.h, whose min and max macros would otherwise break its declarations)
+#include "platform.h"  // what differs between Windows and Linux: memory checks, the slot, the clock
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1203,9 +1208,8 @@ static Block& B = g_block;
 typedef void (*tidy_fn)(void* self);    // x64: a member call is `this` in rcx
 static tidy_fn  g_tidy_original = nullptr;
 static void**   g_slot = nullptr;       // the vtable slot patched
-static uintptr_t g_base = 0;            // DF's exe, as loaded
 static FILE*    g_log = nullptr;
-static double   g_us_per_tick = 0;      // QueryPerformanceCounter ticks to microseconds
+static double   g_us_per_tick = 0;      // the clock's ticks to microseconds (platform.h)
 static bool     g_disabled = false;
 static uint32_t g_frame = 0;            // plans made: dates the per-frame block reads
 
@@ -1222,73 +1226,16 @@ static void log_line(const char* fmt, ...) {
     fflush(g_log);
 }
 
-// Is [p, p + n) committed, readable memory in one region? Every pointer the
-// hook follows before patching is checked this way first, so a wrong
-// address from Lua refuses instead of faulting.
-static bool readable(const void* p, size_t n) {
-    MEMORY_BASIC_INFORMATION m;
-    if (!p || VirtualQuery(p, &m, sizeof m) != sizeof m) return false;
-    if (m.State != MEM_COMMIT) return false;
-    if (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-    uintptr_t end = (uintptr_t)m.BaseAddress + m.RegionSize;
-    return (uintptr_t)p + n <= end;
-}
+// Is [p, p + n) readable memory? Every pointer the hook follows before
+// patching is checked this way first, so a wrong address from Lua refuses
+// instead of faulting. (How it's asked differs by system: platform.h.)
+static bool readable(const void* p, size_t n) { return plat_readable(p, n); }
 
-// Whether n bytes from p are all readable, however many regions they span.
-// readable() asks about one region (pages with the same allocation and
-// protection), and a block of pixels can sit across two good ones: test 7
-// refused 229 of 2571 copies that way, and they stayed blank on screen.
-static bool readable_span(const void* p, size_t n) {
-    uintptr_t at = (uintptr_t)p;
-    const uintptr_t end = at + n;
-    while (at < end) {
-        MEMORY_BASIC_INFORMATION m;
-        if (!at || VirtualQuery((const void*)at, &m, sizeof m) != sizeof m) return false;
-        if (m.State != MEM_COMMIT || (m.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
-        const uintptr_t region_end = (uintptr_t)m.BaseAddress + m.RegionSize;
-        if (region_end <= at) return false;
-        at = region_end;
-    }
-    return true;
-}
+// Whether n bytes from p are all readable, however many regions they span
+// (a block of pixels can sit across two: test 7, in platform_windows.h).
+static bool readable_span(const void* p, size_t n) { return plat_readable_span(p, n); }
 
-// Is p inside DF's exe as loaded (code or data)?
-static bool in_exe(const void* p) {
-    MEMORY_BASIC_INFORMATION m;
-    if (!p || VirtualQuery(p, &m, sizeof m) != sizeof m) return false;
-    return m.State == MEM_COMMIT && (uintptr_t)m.AllocationBase == g_base;
-}
-
-// Is p code inside DF's exe?
-static bool is_code(const void* p) {
-    MEMORY_BASIC_INFORMATION m;
-    if (!p || VirtualQuery(p, &m, sizeof m) != sizeof m) return false;
-    if (m.State != MEM_COMMIT || (uintptr_t)m.AllocationBase != g_base) return false;
-    return (m.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
-                         PAGE_EXECUTE_WRITECOPY)) != 0;
-}
-
-// The renderer's class name (MSVC x64 RTTI), for the record: the slot
-// before a vtable holds its CompleteObjectLocator (signature 1, two
-// offsets, then the TypeDescriptor as an RVA); the decorated name sits 16
-// bytes into the TypeDescriptor (".?AVrenderer_2d@@" in test 1).
-static void read_class_name(void** vt) {
-    memcpy(B.renderer_class, "(unread)", 9);
-    if (!readable(vt - 1, 8)) return;
-    const uint32_t* col = (const uint32_t*)vt[-1];
-    if (!readable(col, 24) || col[0] != 1) return;
-    const char* name = (const char*)(g_base + col[3] + 16);
-    if (!readable(name, sizeof B.renderer_class)) return;
-    size_t i = 0;
-    for (; i + 1 < sizeof B.renderer_class && name[i]; i++) B.renderer_class[i] = name[i];
-    B.renderer_class[i] = 0;
-}
-
-static double ticks_now() {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return (double)t.QuadPart;
-}
+static double ticks_now() { return plat_ticks_now(); }
 
 // =====================================================================
 // TEXTURES: which are the snow's
@@ -7652,29 +7599,27 @@ static bool install_hook() {
     uint8_t* obj = (uint8_t*)(uintptr_t)B.renderer;
     if (!readable(obj, 8)) { log_line("NOT HOOKING: the renderer address from Lua is not readable."); return false; }
     void** vt = *(void***)obj;
-    if (!readable(vt, (RENDER_SLOT + 1) * sizeof(void*)) || !in_exe(vt)) {
-        log_line("NOT HOOKING: the renderer's vtable is not inside DF's exe.");
+    if (!readable(vt, (RENDER_SLOT + 1) * sizeof(void*))) {
+        log_line("NOT HOOKING: the renderer's vtable is not readable.");
         return false;
     }
-    read_class_name(vt);
+    // (the checks that this is the game's own renderer, with tidy_tile_cache in the slot: platform.h)
+    char why[200] = "";
+    memcpy(B.renderer_class, "(unread)", 9);
+    if (!plat_check_renderer(vt, TIDY_SLOT, RENDER_SLOT, B.renderer_class, sizeof B.renderer_class, why, sizeof why)) {
+        log_line("NOT HOOKING: %s.", why);
+        return false;
+    }
     void* tidy = vt[TIDY_SLOT];
-    void* render = vt[RENDER_SLOT];
-    if (!is_code(tidy) || !is_code(render) || tidy == render) {
-        log_line("NOT HOOKING: slots %zu and %zu of %s are not both DF code.",
-                 TIDY_SLOT, RENDER_SLOT, B.renderer_class);
-        return false;
-    }
-    DWORD old;
-    if (!VirtualProtect(&vt[TIDY_SLOT], sizeof(void*), PAGE_READWRITE, &old)) {
-        log_line("NOT HOOKING: VirtualProtect failed (%lu).", GetLastError());
-        return false;
-    }
     g_tidy_original = (tidy_fn)tidy;
-    InterlockedExchangePointer(&vt[TIDY_SLOT], (void*)&tidy_hook);
-    VirtualProtect(&vt[TIDY_SLOT], sizeof(void*), old, &old);
+    if (!plat_patch_slot(&vt[TIDY_SLOT], (void*)&tidy_hook, why, sizeof why)) {
+        g_tidy_original = nullptr;
+        log_line("NOT HOOKING: %s.", why);
+        return false;
+    }
     g_slot = &vt[TIDY_SLOT];
     log_line("hooked: %s, slot %zu (tidy_tile_cache) at RVA 0x%llX.", B.renderer_class,
-             TIDY_SLOT, (unsigned long long)((uintptr_t)tidy - g_base));
+             TIDY_SLOT, (unsigned long long)((uintptr_t)tidy - plat_code_base(tidy)));
     return true;
 }
 
@@ -7687,12 +7632,12 @@ static void uninstall_hook() {
         log_line("shutdown: the slot no longer holds this hook; left as it is.");
         return;
     }
-    DWORD old;
-    if (VirtualProtect(g_slot, sizeof(void*), PAGE_READWRITE, &old)) {
-        InterlockedExchangePointer(g_slot, (void*)g_tidy_original);
-        VirtualProtect(g_slot, sizeof(void*), old, &old);
+    char why[200] = "";
+    if (plat_patch_slot(g_slot, (void*)g_tidy_original, why, sizeof why)) {
         B.hooked = 0;
         log_line("shutdown: tidy_tile_cache put back.");
+    } else {
+        log_line("shutdown: tidy_tile_cache not put back: %s.", why);
     }
 }
 
@@ -7701,16 +7646,12 @@ static void uninstall_hook() {
 // =====================================================================
 // The chain loader calls libraries with a lower priority first; DFHack
 // exports 100, so 200 runs this one's per-frame call after DFHack's.
-extern "C" __declspec(dllexport) const int32_t dfhooks_priority = 200;
+extern "C" DW_EXPORT const int32_t dfhooks_priority = 200;
 
-extern "C" __declspec(dllexport) void dfhooks_init() {
+extern "C" DW_EXPORT void dfhooks_init() {
     g_log = fopen("detailed_weather_hook.log", "w");
-    g_base = (uintptr_t)GetModuleHandleW(nullptr);
-    LARGE_INTEGER f;
-    QueryPerformanceFrequency(&f);
-    g_us_per_tick = 1e6 / (double)f.QuadPart;
-    log_line("Detailed Weather hook DLL, layout %u (test 16A, the wave). DF image base 0x%llX.", LAYOUT,
-             (unsigned long long)g_base);
+    g_us_per_tick = plat_us_per_tick();
+    log_line("Detailed Weather hook library (%s), layout %u (test 16A, the wave).", DW_LIBRARY_NAME, LAYOUT);
 
     // ---- THE BLOCK, PUBLISHED ----
     // Published even when disabled, so Lua can say why nothing happens.
@@ -7730,12 +7671,11 @@ extern "C" __declspec(dllexport) void dfhooks_init() {
     B.wave_slots_most = WAVE_SLOTS;
     char addr[32];
     snprintf(addr, sizeof addr, "%llX", (unsigned long long)(uintptr_t)&g_block);
-    // _putenv_s updates the C runtime's environment, which DFHack's Lua
-    // reads through os.getenv (both use the shared UCRT, as Stockhook found).
-    if (_putenv_s("DWHOOK_BLOCK", addr) != 0) log_line("could not publish DWHOOK_BLOCK.");
+    // (how the environment is set so DFHack's Lua reads it with os.getenv: platform.h)
+    if (!plat_publish("DWHOOK_BLOCK", addr)) log_line("could not publish DWHOOK_BLOCK.");
     else log_line("block published at 0x%s (%u bytes).", addr, (unsigned)sizeof(Block));
 
-    if (GetFileAttributesA("detailed_weather_hook.disable") != INVALID_FILE_ATTRIBUTES) {
+    if (plat_file_exists("detailed_weather_hook.disable")) {
         g_disabled = true;
         log_line("detailed_weather_hook.disable present: doing nothing this session.");
     }
@@ -7746,7 +7686,7 @@ extern "C" __declspec(dllexport) void dfhooks_init() {
 // texture map when new tables come, puts back the game's own values in the
 // buffer DF is about to draw (PUT BACK; also how turning the snow off
 // clears it, a buffer a frame), and works out this frame (THE PLAN).
-extern "C" __declspec(dllexport) void dfhooks_prerender() {
+extern "C" DW_EXPORT void dfhooks_prerender() {
     B.prerender_calls++;
     if (g_disabled) return;
     read_view_as_drawn();
@@ -7803,7 +7743,7 @@ extern "C" __declspec(dllexport) void dfhooks_prerender() {
     plan_spatter();  // (THE SPATTER DRAWN HERE: the fallen amounts read on this thread)
 }
 
-extern "C" __declspec(dllexport) void dfhooks_shutdown() {
+extern "C" DW_EXPORT void dfhooks_shutdown() {
     B.enabled = 0;
     uninstall_hook();
     log_line("shutdown: prerender %lld, renderer %lld, plans %lld, written %lld, not written %lld;"
