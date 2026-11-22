@@ -1545,10 +1545,11 @@ rain_running_now = rain_running_now or false
 rain_why_not = rain_why_not or nil
 local rain_next_try = 0
 rain_handed = rain_handed or {rain = nil, snow = nil}   -- the sheet each kind's table holds (its name)
+rain_held = rain_held or {rain = {}, snow = {}}          -- and which of its groups (hand_group)
 rain_cache = rain_cache or {codes = {}, count = 0}   -- each block's weather code, by level and block
 rain_any = rain_any or {rain = false, snow = false}   -- what the last grid held
 rain_times = rain_times or {grids = 0, grid_ms = 0, lookups = 0, sheets = 0, sheet_ms = 0}
-local rain_grid_buf, rain_tex_buf = nil, nil   -- scratch for the one-move copies
+local rain_grid_buf = nil   -- scratch for the one-move copy
 -- THE START, TIMED (15N): rain took a long while to show in play after loading, unmeasured. Each step
 -- of its start is timed (os.clock) from native.lua's first frame on the map: the DLL drawing started,
 -- rain or snow first in the weather grid, a sheet first handed over, and the first tile the DLL drew.
@@ -1573,6 +1574,7 @@ local function rain_start(base)
     poke('int32_t', base + OFF.rain_tex_n, 0)
     poke('int32_t', base + OFF.snow_tex_n, 0)
     rain_handed = {rain = nil, snow = nil}
+    rain_held = {rain = {}, snow = {}}
     rain_cache = {codes = {}, count = 0}
     rain_any = {rain = false, snow = false}
     for _, name in ipairs({'rain_frames', 'rain_drawn', 'rain_put_back'}) do poke('int64_t', base + OFF[name], 0) end
@@ -1675,25 +1677,49 @@ function rain_weather(viewport, weather_at, full)
     rain_times.grid_ms = rain_times.grid_ms + (clock_s() - t0) * 1000
 end
 
--- A sheet's tiles into the DLL's table for its kind: every tile's texpos, 0 where the sheet's layout
--- says nothing is drawn (as detailed_weather.lua's draw skipped them). n is set to 0 first and to the
--- count last, so the DLL draws nothing of that kind while the table is part written.
-local function hand_sheet(base, kind, sheet, empty, n, texpos_of)
-    local t0 = clock_s()
-    if n > RAIN_TEX then qerror(('the %s sheet has %d tiles, the DLL takes at most %d'):format(kind, n, RAIN_TEX)) end
-    local count_off, tex_off = OFF[kind .. '_tex_n'], OFF[kind .. '_tex']
-    poke('int32_t', base + count_off, 0)
-    if not rain_tex_buf then rain_tex_buf = df.new('int32_t', RAIN_TEX) end
-    local buf, tiles = rain_tex_buf, sheet.tiles
-    for index = 1, n do
-        buf[index - 1] = (empty and empty[index]) and 0 or texpos_of(tiles[index])
+-- THE ART'S GROUPS. The DLL's tables are by a sheet's tile numbers as drawn, but it only ever reads
+-- the tiles of the one group Lua tells it to draw (a slant of the rain, a wind of the snow or leaves, a
+-- density of the fog), and the art is packed a file per group (detailed_weather.lua: sheet_of,
+-- sheet_tiles). So a table is filled a group at a time, as each is first wanted, and only those
+-- files are ever loaded.
+--   held    what the table holds: {sheet =, groups = (group -> true once written), last = the group
+--           last wanted that was there}. A new sheet empties the table first.
+--   n       the sheet's tiles as drawn; f.sheet_tiles(sheet, group) gives a group's textures, or nil
+--           while its file waits its turn to load; f.texpos_of(handle).
+-- Returns the group to draw: the one wanted once it's written, until then the last one that was
+-- (so nothing blinks off while a file loads), or nil with none yet; and whether it wrote one now.
+-- Entries go from 0 (nothing drawn) to their texture one at a time, so the DLL can draw meanwhile.
+local function hand_group(base, held, n_off, tex_off, most, sheet, group, n, f)
+    if n > most then qerror(('the sheet %s has %d tiles, the DLL takes at most %d'):format(sheet.name, n, most)) end
+    local wrote = false
+    if held.sheet ~= sheet then
+        poke('int32_t', base + n_off, 0)
+        local entries = df.reinterpret_cast('int32_t', base + tex_off)
+        for index = 0, n - 1 do entries[index] = 0 end
+        held.sheet, held.groups, held.last = sheet, {}, nil
+        poke('int32_t', base + n_off, n)
     end
-    local _, src = df.sizeof(buf)
-    dfhack.internal.memmove(base + tex_off, src, n * 4)
-    poke('int32_t', base + count_off, n)
-    rain_clock.sheet = rain_clock.sheet or clock_s()
-    rain_times.sheets = rain_times.sheets + 1
-    rain_times.sheet_ms = rain_times.sheet_ms + (clock_s() - t0) * 1000
+    if not held.groups[group] then
+        local tiles = f.sheet_tiles(sheet, group)
+        if tiles then
+            local layout = sheet.layout
+            local side = layout.cells or layout.patch
+            local tiles_a_group, group_count = side * side * layout.frames, sheet.group_count
+            local entries, at, texpos_of = df.reinterpret_cast('int32_t', base + tex_off), sheet.at, f.texpos_of
+            for number = 1, n do
+                if (number - 1) // tiles_a_group % group_count + 1 == group then
+                    local place = at[number]
+                    local handle = place and place > 0 and tiles[place]
+                    local texpos = handle and texpos_of(handle)
+                    entries[number - 1] = (texpos and texpos > 0) and texpos or 0
+                end
+            end
+            held.groups[group] = true
+            wrote = true
+        end
+    end
+    if held.groups[group] then held.last = group end
+    return held.last, wrote
 end
 
 -- Each frame, from detailed_weather.lua's overlay: f holds both kinds' layouts (art/rain_sheet.lua,
@@ -1705,22 +1731,40 @@ function rain_frame(f)
     local base = block()
     if not base then return end
     local rl, sl = f.rain_layout, f.snow_layout
-    if f.rain_sheet and rain_handed.rain ~= f.rain_name then
-        poke('int32_t', base + OFF.rain_cells, rl.cells)
-        poke('int32_t', base + OFF.rain_anim, rl.frames)
-        poke('int32_t', base + OFF.rain_slants, #rl.slants)
-        hand_sheet(base, 'rain', f.rain_sheet, rl.empty and rl.empty[f.rain_level], #rl.surfaces * #rl.slants * rl.cells * rl.cells * rl.frames, f.texpos_of)
-        rain_handed.rain = f.rain_name
+    local slant, snow_wind = f.slant, f.snow_wind
+    local t0 = clock_s()
+    local wrote_rain, wrote_snow = false, false
+    if f.rain_sheet then
+        if rain_handed.rain ~= f.rain_name then
+            poke('int32_t', base + OFF.rain_cells, rl.cells)
+            poke('int32_t', base + OFF.rain_anim, rl.frames)
+            poke('int32_t', base + OFF.rain_slants, #rl.slants)
+            rain_handed.rain = f.rain_name
+        end
+        local drawn
+        drawn, wrote_rain = hand_group(base, rain_held.rain, OFF.rain_tex_n, OFF.rain_tex, RAIN_TEX, f.rain_sheet, f.slant,
+                                       #rl.surfaces * #rl.slants * rl.cells * rl.cells * rl.frames, f)
+        slant = drawn or slant
     end
-    if f.snow_sheet and rain_handed.snow ~= f.snow_name then
-        poke('int32_t', base + OFF.snow_cells, sl.cells)
-        poke('int32_t', base + OFF.snow_anim, sl.frames)
-        hand_sheet(base, 'snow', f.snow_sheet, sl.empty and sl.empty[f.snow_level], #sl.winds * sl.cells * sl.cells * sl.frames, f.texpos_of)
-        rain_handed.snow = f.snow_name
+    if f.snow_sheet then
+        if rain_handed.snow ~= f.snow_name then
+            poke('int32_t', base + OFF.snow_cells, sl.cells)
+            poke('int32_t', base + OFF.snow_anim, sl.frames)
+            rain_handed.snow = f.snow_name
+        end
+        local drawn
+        drawn, wrote_snow = hand_group(base, rain_held.snow, OFF.snow_tex_n, OFF.snow_tex, RAIN_TEX, f.snow_sheet, f.snow_wind,
+                                       #sl.winds * sl.cells * sl.cells * sl.frames, f)
+        snow_wind = drawn or snow_wind
     end
-    poke('int32_t', base + OFF.rain_slant, f.slant)
+    if wrote_rain or wrote_snow then
+        rain_clock.sheet = rain_clock.sheet or clock_s()
+        rain_times.sheets = rain_times.sheets + (wrote_rain and 1 or 0) + (wrote_snow and 1 or 0)
+        rain_times.sheet_ms = rain_times.sheet_ms + (clock_s() - t0) * 1000
+    end
+    poke('int32_t', base + OFF.rain_slant, slant)
     poke('int32_t', base + OFF.rain_frame, f.rain_frame)
-    poke('int32_t', base + OFF.snow_wind, f.snow_wind)
+    poke('int32_t', base + OFF.snow_wind, snow_wind)
     poke('int32_t', base + OFF.snow_frame, f.snow_frame)
     -- (THE START, TIMED: the first frame the DLL has drawn a tile)
     if not rain_clock.drawn and peek('int64_t', base + OFF.rain_drawn) > 0 then rain_clock.drawn = clock_s() end
@@ -1743,7 +1787,7 @@ local function report_rain(base)
         print(('  drawing: %.1f us a frame on average, worst %.1f us')
               :format(peek('double', base + OFF.rain_us_total) / frames, peek('double', base + OFF.rain_us_max)))
     end
-    print(('  sheets handed over: rain %s (%d tiles), snow %s (%d tiles); %d handed, %.1f ms each')
+    print(('  sheets handed over: rain %s (%d tiles), snow %s (%d tiles); %d groups handed, %.1f ms each')
           :format(rain_handed.rain or 'none yet', peek('int32_t', base + OFF.rain_tex_n), rain_handed.snow or 'none yet',
                   peek('int32_t', base + OFF.snow_tex_n), rain_times.sheets,
                   rain_times.sheets > 0 and rain_times.sheet_ms / rain_times.sheets or 0))
@@ -2076,19 +2120,21 @@ wfog_wanted = wfog_wanted ~= false        -- `native wfog` turns the fog off and
 wfog_running_now = wfog_running_now or false
 wfog_why_not = wfog_why_not or nil
 local wfog_next_try = 0
-wfog_handed = wfog_handed or nil          -- the fog sheet's handles handed over
+wfog_handed = wfog_handed or nil          -- the fog sheet handed over
+wfog_held = wfog_held or {}               -- and which of its groups (hand_group)
 leaf_wanted = leaf_wanted ~= false        -- `native leaves`
 leaf_running_now = leaf_running_now or false
 leaf_why_not = leaf_why_not or nil
 local leaf_next_try = 0
-leaf_handed = leaf_handed or {}           -- sheet name -> its slot, 1 to LEAF_SHEETS, once handed over
+leaf_handed = leaf_handed or {}           -- sheet name -> its slot, 1 to LEAF_SHEETS, once it has one
+leaf_held = leaf_held or {}               -- sheet name -> {sheet =, held = (hand_group), n = its tiles}
+leaf_wind_sent = leaf_wind_sent or nil    -- the wind the DLL draws: the last one every shedding sheet had
 leaf_layout = leaf_layout or nil          -- the first sheet's layout (the others must match it)
 leaf_spec_sent = leaf_spec_sent or {}     -- plant raw -> the spec last written
 local WFOG_TEX, WFOG_DEPTHS = 16384, 9    -- the DLL's WFOG_TEX, WFOG_DEPTHS
 local LEAF_RAWS, LEAF_SHEETS, LEAF_TEX = 1024, 8, 10240   -- the DLL's LEAF_RAWS, LEAF_SHEETS, LEAF_TEX
 local LEAF_RECHECK = 3600                 -- frames before a block's leaves are worked out again (leaves.lua
                                           -- forgot all every 60 s: FORGET_MS)
-local tile_buf = nil                      -- scratch for the one-move copies of a sheet
 
 -- leaves.lua (MODULES KEPT, as colour.lua's)
 local leaves_kept = nil
@@ -2123,21 +2169,6 @@ fill_weather_tt = function(base)
     end
 end
 
--- A sheet's texpos by tile into the DLL (0 for a tile with nothing drawn in it), its count written last
-local function hand_tiles(base, n_off, tex_off, most, handles, empty, n, texpos_of)
-    if n > most or n > #handles then return false end
-    poke('int32_t', base + n_off, 0)
-    if not tile_buf then tile_buf = df.new('int32_t', math.max(WFOG_TEX, LEAF_TEX)) end
-    for index = 1, n do
-        local texpos = not (empty and empty[index]) and texpos_of(handles[index]) or 0
-        tile_buf[index - 1] = (texpos and texpos > 0) and texpos or 0
-    end
-    local _, src = df.sizeof(tile_buf)
-    dfhack.internal.memmove(base + tex_off, src, n * 4)
-    poke('int32_t', base + n_off, n)
-    return true
-end
-
 local function wfog_start(base)
     poke('uint32_t', base + OFF.wfog_on, 0)
     fill_common(base)
@@ -2146,7 +2177,7 @@ local function wfog_start(base)
     fill_weather_tt(base)
     poke('int32_t', base + OFF.wfog_level, 0)
     poke('int32_t', base + OFF.wfog_tex_n, 0)
-    wfog_handed = nil
+    wfog_handed, wfog_held = nil, {}
     for _, name in ipairs({'wfog_frames_drawn', 'wfog_drawn', 'wfog_put_back'}) do poke('int64_t', base + OFF[name], 0) end
     poke('double', base + OFF.wfog_us_total, 0)
     poke('double', base + OFF.wfog_us_max, 0)
@@ -2198,7 +2229,7 @@ local function leaf_start(base)
         poke('uint16_t', base + OFF.leaf_spec + raw * 2, 0)
     end
     for k = 0, LEAF_SHEETS - 1 do poke('int32_t', base + OFF.leaf_tex_n + k * 4, 0) end
-    leaf_handed, leaf_layout, leaf_spec_sent = {}, nil, {}
+    leaf_handed, leaf_layout, leaf_spec_sent, leaf_held, leaf_wind_sent = {}, nil, {}, {}, nil
     poke('uint32_t', base + OFF.leaf_any, 0)
     poke('uint32_t', base + OFF.leaf_recheck, LEAF_RECHECK)
     poke('uint32_t', base + OFF.leaf_tables, (peek('uint32_t', base + OFF.leaf_tables) + 1) & 0xffffffff)
@@ -2267,34 +2298,37 @@ end
 function wfog_running() return wfog_running_now end
 function leaves_running() return leaf_running_now end
 
--- Each frame, from detailed_weather.lua's overlay: f.level the sheet's density (0: no fog), f.steps each
--- depth's drift (0-based by depth), f.layout (art/fog_sheet.lua), f.handles the sheet's, f.texpos_of.
+-- Each frame, from detailed_weather.lua's overlay: f.level the density (0: no fog), which is also the
+-- sheet's group; f.steps each depth's drift (0-based by depth), f.layout (art/fog_sheet.lua), f.sheet
+-- the fog's (sheet_of), f.sheet_tiles, f.texpos_of.
 function wfog_frame(f)
     if not wfog_running_now then return end
     local base = block()
     if not base then return end
     local L = f.layout
-    if f.level > 0 and f.handles and wfog_handed ~= f.handles then
-        local n = L.levels * (L.substeps or 1) * L.patch * L.patch * L.frames
-        if hand_tiles(base, OFF.wfog_tex_n, OFF.wfog_tex, WFOG_TEX, f.handles, nil, n, f.texpos_of) then
+    local level = nil
+    if f.level > 0 and f.sheet then
+        if wfog_handed ~= f.sheet then
             poke('int32_t', base + OFF.wfog_patch, L.patch)
             poke('int32_t', base + OFF.wfog_frames, L.frames)
-            wfog_handed = f.handles
+            wfog_handed = f.sheet
         end
+        level = hand_group(base, wfog_held, OFF.wfog_tex_n, OFF.wfog_tex, WFOG_TEX, f.sheet, f.level,
+                           L.levels * (L.substeps or 1) * L.patch * L.patch * L.frames, f)
     end
-    if f.level <= 0 or not wfog_handed then return end
+    if f.level <= 0 or not level then return end
     for d = 0, WFOG_DEPTHS - 1 do poke('int32_t', base + OFF.wfog_steps + d * 4, f.steps[d] or 0) end
-    poke('int32_t', base + OFF.wfog_level, f.level)   -- (last: the DLL draws with this frame's drift)
+    poke('int32_t', base + OFF.wfog_level, level)   -- (last: the DLL draws with this frame's drift)
 end
 
 -- Each frame, from detailed_weather.lua's overlay: f.specs what each tree raw sheds now ({sheet name,
 -- heaviness}; nil out of season), f.frame the animation's frame, f.wind_index_for(layout), f.sheet_of(name)
--- (the art, loaded the first time it's asked for: nil while it waits), f.texpos_of.
+-- (the art's layout and index), f.sheet_tiles (a group's textures, nil while its file waits), f.texpos_of.
 function leaves_frame(f)
     if not leaf_running_now or not f.specs then return end
     local base = block()
     if not base then return end
-    local wanted = {}
+    local wanted, wanted_sheets = {}, {}
     for raw, sp in pairs(f.specs) do
         local name, heaviness = sp[1], sp[2]
         local slot = leaf_handed[name]
@@ -2308,9 +2342,9 @@ function leaves_frame(f)
             if same and count < LEAF_SHEETS then
                 local n = L.heaviness * #L.winds * L.cells * L.cells * L.frames
                 slot = count + 1
-                if hand_tiles(base, OFF.leaf_tex_n + (slot - 1) * 4, OFF.leaf_tex + (slot - 1) * LEAF_TEX * 4, LEAF_TEX,
-                              art.tiles, L.empty, n, f.texpos_of) then
+                if n <= LEAF_TEX then
                     leaf_handed[name] = slot
+                    leaf_held[name] = {sheet = art, held = {}, n = n}
                     if not leaf_layout then
                         leaf_layout = L
                         poke('int32_t', base + OFF.leaf_cells, L.cells)
@@ -2321,7 +2355,7 @@ function leaves_frame(f)
                 else slot = nil end
             end
         end
-        if slot and raw >= 0 and raw < LEAF_RAWS then wanted[raw] = slot | (heaviness << 8) end
+        if slot and raw >= 0 and raw < LEAF_RAWS then wanted[raw] = slot | (heaviness << 8) wanted_sheets[name] = slot end
     end
     -- the specs written where they changed (a raw no longer shedding: 0)
     for raw in pairs(leaf_spec_sent) do
@@ -2332,7 +2366,17 @@ function leaves_frame(f)
     end
     if not leaf_layout then return end
     poke('int32_t', base + OFF.leaf_frame, f.frame % leaf_layout.frames)
-    poke('int32_t', base + OFF.leaf_wind, f.wind_index_for(leaf_layout))
+    -- this wind's group of every sheet shedding now (a file a frame at most: sheet_tiles); the DLL
+    -- keeps the wind before until they all have it, so no kind of leaf blinks off while it waits
+    local wind, all_there = f.wind_index_for(leaf_layout), true
+    for name, slot in pairs(wanted_sheets) do
+        local kept = leaf_held[name]
+        local drawn = hand_group(base, kept.held, OFF.leaf_tex_n + (slot - 1) * 4, OFF.leaf_tex + (slot - 1) * LEAF_TEX * 4,
+                                 LEAF_TEX, kept.sheet, wind, kept.n, f)
+        if drawn ~= wind then all_there = false end
+    end
+    if all_there or not leaf_wind_sent then leaf_wind_sent = wind end
+    poke('int32_t', base + OFF.leaf_wind, leaf_wind_sent)
     poke('uint32_t', base + OFF.leaf_any, next(wanted) and 1 or 0)   -- (last)
 end
 

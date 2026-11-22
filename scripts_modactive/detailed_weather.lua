@@ -280,16 +280,16 @@ local function layout_file_of(name)
 end
 
 -- A sheet by name: {name =, layout =, at = (tile number -> place in its group's file, 0: empty),
--- groups = (group -> its textures, once loaded)}.
+-- groups = (group -> its textures, once loaded), group_count = how many groups}.
 local function sheet_of(name)
     local sheet = art.sheets[name]
     -- (or one from before the art was packed, in a game running since: it has no groups)
-    if not sheet or not sheet.groups then
+    if not sheet or not sheet.groups or not sheet.group_count then
         local family = family_of(name)
         art.indexes = art.indexes or {}
         art.indexes[family] = art.indexes[family] or dofile(art_dir .. 'falling/' .. family .. '.lua')
         sheet = {name = name, layout = dofile(art_dir .. layout_file_of(name)), at = art.indexes[family].at,
-                 groups = {}}
+                 groups = {}, group_count = art.indexes[family].groups}
         art.sheets[name] = sheet
     end
     return sheet
@@ -629,37 +629,6 @@ local function texpos_of(handle)
     return texpos
 end
 
--- A WHOLE SHEET FOR THE HOOK LIBRARY. The library's tables are by a sheet's tile numbers as drawn,
--- every group at once; the art is packed a file per group (sheet_of). Until the library knows the
--- groups itself, a sheet it's handed gets `tiles`: for every tile number its texture's handle, or
--- false for a tile with nothing drawn. Every group's file is loaded for it, in the one frame.
-local function whole_sheet(name)
-    local sheet = sheet_of(name)
-    if not sheet.tiles then
-        local layout = sheet.layout
-        local side = layout.cells or layout.patch
-        local tiles_a_group = side * side * layout.frames
-        local group_count = art.indexes[family_of(name)].groups
-        local tiles = {}
-        for number, place in ipairs(sheet.at) do
-            local handle = false
-            if place > 0 then
-                local group = (number - 1) // tiles_a_group % group_count + 1
-                local handles = sheet.groups[group]
-                if not handles then
-                    handles = dfhack.textures.loadTileset(art_path(('falling/%s-%d.png'):format(name, group)), 32, 32, true)
-                    sheet.groups[group] = handles
-                end
-                handle = handles[place] or false
-            end
-            tiles[number] = handle
-        end
-        sheet.tiles = tiles
-    end
-    return sheet
-end
-local function whole_texpos_of(handle) return handle and texpos_of(handle) or 0 end
-
 ----------------------------------------------------------------------------------------------
 -- Changing map
 ----------------------------------------------------------------------------------------------
@@ -981,7 +950,7 @@ function RainOverlay:draw_weather(dc)
             -- (THE LEAVES DRAWN BY THE DLL, test 15X: what each tree sheds now, and the sheets, handed over)
             self:timed('leaves', function()
                 native.leaves_frame({specs = leaves.native_frame(strength), frame = frame, wind_index_for = wind_index_for,
-                                     sheet_of = whole_sheet, texpos_of = whole_texpos_of})
+                                     sheet_of = sheet_of, sheet_tiles = sheet_tiles, texpos_of = texpos_of})
             end)
         else
             self:timed('leaves', leaves.apply, viewport, sheet_of, sheet_tiles, texpos_of, frame, wind_index_for, strength)
@@ -1025,12 +994,12 @@ function RainOverlay:draw_weather(dc)
             local snow_level = self.snow_level or precipitation.LIGHTEST
             native.rain_frame({
                 rain_layout = layout, rain_level = rain_level, rain_name = 'rain_' .. rain_level,
-                rain_sheet = has_rain and whole_sheet('rain_' .. rain_level) or nil,
+                rain_sheet = has_rain and sheet_of('rain_' .. rain_level) or nil,
                 slant = slant_for_wind(layout.slants), rain_frame = frame % layout.frames,
                 snow_layout = snow_layout, snow_level = snow_level, snow_name = 'snow_' .. snow_level,
-                snow_sheet = has_snow and whole_sheet('snow_' .. snow_level) or nil,
+                snow_sheet = has_snow and sheet_of('snow_' .. snow_level) or nil,
                 snow_wind = slant_for_wind(snow_layout.winds), snow_frame = frame % snow_layout.frames,
-                texpos_of = whole_texpos_of,
+                sheet_tiles = sheet_tiles, texpos_of = texpos_of,
             })
         end)
     end
@@ -1042,7 +1011,7 @@ function RainOverlay:draw_weather(dc)
             local level, steps = 0, nil
             if (self.fog or 0) > 0 then level, steps = self:fog_drift(now) end
             native.wfog_frame({level = level, steps = steps, layout = art.fog_layout,
-                               handles = level > 0 and whole_sheet('fog').tiles or nil, texpos_of = whole_texpos_of})
+                               sheet = level > 0 and sheet_of('fog') or nil, sheet_tiles = sheet_tiles, texpos_of = texpos_of})
         end)
     end
 
