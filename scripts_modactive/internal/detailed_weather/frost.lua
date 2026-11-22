@@ -44,6 +44,8 @@
 -- tiles are remembered for a few seconds and worked out a few hundred a frame.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local grass = reqscript('internal/detailed_weather/grass')   -- texture pixels, grass edge art
 -- every texture Detailed Weather makes (frost, snow...), shared, so the colour swap leaves them be
 _G.detailed_weather_made = _G.detailed_weather_made or {}
@@ -51,6 +53,7 @@ local made = _G.detailed_weather_made
 local snow_ramps = reqscript('internal/detailed_weather/snow_ramps')   -- its snowy edges
 local colour = reqscript('internal/detailed_weather/colour')           -- the look, for ramps
 local looks = reqscript('internal/detailed_weather/looks')             -- how ramps are redrawn for it
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
 
 local MOST_DEPTH = 8
 local SNOWY = 100            -- snow amount from which the game draws snow (as snow_ramps.lua)
@@ -668,8 +671,9 @@ local function baked_texpos(key, bake, state)
     local entry = baked[key]
     if entry == nil then
         -- timed from the frame's first bake, so the drawing before it doesn't eat the budget
-        if state.baked == 0 then state.bake_started = dfhack.getTickCount()
-        elseif dfhack.getTickCount() - state.bake_started >= BAKE_MS * allowance then return nil end
+        if state.baked == 0 then
+            state.bake_started, state.bake_ms = clock_ms(), work_time.take(BAKE_MS * allowance)
+        elseif clock_ms() - state.bake_started >= state.bake_ms then return nil end
         state.baked = state.baked + 1
         -- (the cache only starts afresh for its size when textures are being deleted: grass.lua)
         if grass.delete_textures and baked_count >= BAKED_MOST then clear_cache() end
@@ -772,11 +776,11 @@ warm_at = warm_at or 0
 warm_view, warm_idle = warm_view or nil, warm_idle or 0
 
 function plan(viewport)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     local block_at = grass.block_at   -- kept between plans
 
     -- one tile from scratch: which level it shows, and its band if it's an outdoor floor or ramp
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     local function work_out(x, y)
         local depth, z = 0, viewport.z
         while depth <= MOST_DEPTH do
@@ -814,9 +818,11 @@ function plan(viewport)
     if remembered_count > REMEMBER_MOST then forget() end
     local budget, complete = WORK_PER_PLAN, true
     local z = viewport.z
-    local slice_ms, new_tiles_ms = SLICE_MS * allowance, NEW_TILES_MS * allowance
-    local function out_of_time() return dfhack.getTickCount() - started >= slice_ms end
-    local function out_of_time_for_new() return dfhack.getTickCount() - started >= new_tiles_ms end
+    -- (the strip a pan brought in gets the longer time; both come out of the one share)
+    local new_tiles_ms = work_time.take(NEW_TILES_MS * allowance)
+    local slice_ms = math.min(SLICE_MS * allowance, new_tiles_ms)
+    local function out_of_time() return clock_ms() - started >= slice_ms end
+    local function out_of_time_for_new() return clock_ms() - started >= new_tiles_ms end
     local function work(x, y, key)
         if not remembered[key] then remembered_count = remembered_count + 1 end
         local tile = work_out(x, y)
@@ -866,7 +872,8 @@ function plan(viewport)
             end
         end
     end
-    timing.plan = timing.plan + (dfhack.getTickCount() - started - timing.plan) * 0.2
+    work_time.done()
+    timing.plan = timing.plan + (clock_ms() - started - timing.plan) * 0.2
     return {z = viewport.z, complete = complete, open_band = open_band}
 end
 
@@ -886,7 +893,7 @@ end
 -- Buffer indexes are worked out afresh from the view as it is now, and checked against each
 -- buffer's size. Run after snow_ramps.apply, so snowy ramps (already swapped) are left alone.
 function apply(planned, viewport)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     -- the colour's copies let go: cracks baked from them may now be keyed by other pictures' numbers
     if seen_generation ~= colour.copies_generation then
         if seen_generation then clear_cache() end
@@ -1049,7 +1056,7 @@ function apply(planned, viewport)
             end
         end
     end
-    timing.apply = timing.apply + (dfhack.getTickCount() - started - timing.apply) * 0.05
+    timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
 end
 
 -- Another map or world loading: what's kept by position belongs to the old map, and what's kept by

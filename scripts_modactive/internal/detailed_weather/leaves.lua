@@ -29,7 +29,10 @@
 -- the flow layer above it). A petal sheet is only loaded once a tree of its colour sheds.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local grass = reqscript('internal/detailed_weather/grass')
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
 
 local TICKS_PER_MONTH = 33600
 local YEAR_TICKS = 12 * TICKS_PER_MONTH
@@ -295,7 +298,7 @@ local function tiles_in_view(viewport, x2, y2, budget_ends)
     local function over_tile(x, y)
         local key = key_of(x, y, z)
         local raw = over[key]
-        if raw == nil and dfhack.getTickCount() < budget_ends then
+        if raw == nil and clock_ms() < budget_ends then
             local seed
             raw, seed = find_over(x, y, z)
             over[key], over_seed[key], over_count = raw, seed, over_count + 1
@@ -330,7 +333,7 @@ end
 -- trees wait); texpos_of: handle -> texpos; wind_index_for(layout): the layout's wind for the wind
 -- now; strength: the wind's strength.
 function apply(viewport, sheet_of, sheet_tiles, texpos_of, frame, wind_index_for, strength)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     local tick = df.global.cur_year_tick
     if not in_season(tick) then return end
     if started >= forget_at then
@@ -343,7 +346,8 @@ function apply(viewport, sheet_of, sheet_tiles, texpos_of, frame, wind_index_for
     local x1, y1 = viewport.x1, viewport.y1
     -- raw memory: never past the buffer's end (just after a zoom the viewport can be larger)
     local x2, y2 = math.min(viewport.x2, x1 + dim_x - 1), math.min(viewport.y2, y1 + dim_y - 1)
-    local tiles = tiles_in_view(viewport, x2, y2, started + PLAN_MS)
+    local tiles = tiles_in_view(viewport, x2, y2, clock_ms() + work_time.take(PLAN_MS))
+    work_time.done()
 
     -- per tree raw index, this frame: false (nothing falling) or what to draw
     local drawing = {}
@@ -369,7 +373,7 @@ function apply(viewport, sheet_of, sheet_tiles, texpos_of, frame, wind_index_for
             if place > 0 and layer[i] == 0 then layer[i] = texpos_of(how.textures[place]) end
         end
     end
-    timing.apply = timing.apply + (dfhack.getTickCount() - started - timing.apply) * 0.05
+    timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
 end
 
 -- What's falling on a tile, for the hover box ('a few maple leaves falling', 'many cherry petals

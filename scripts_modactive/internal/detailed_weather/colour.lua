@@ -43,10 +43,13 @@
 -- whenever it went underground (the fort and the inside of hills sit at 8 C) and back up.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local grass = reqscript('internal/detailed_weather/grass')   -- texture pixels, graphics tokens
 local looks = reqscript('internal/detailed_weather/looks')
 local wetness = reqscript('internal/detailed_weather/wetness')
 local wind = reqscript('internal/detailed_weather/wind')
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
 _G.detailed_weather_made = _G.detailed_weather_made or {}   -- textures the other modules made
 -- every texture the tables have been pointed at (a look's copy, a lean frame) -> the game's own,
 -- kept in the global table so it outlives this script being loaded again (find_refs)
@@ -431,7 +434,7 @@ screen_ms = screen_ms or {}           -- step of update_screen -> ms
 screen_counts = screen_counts or {}   -- what happened -> how many times
 pictures_copied = pictures_copied or {}   -- a picture's sample hash -> true once a copy was made of it
 local function clocked(step, started)
-    screen_ms[step] = (screen_ms[step] or 0) + (dfhack.getTickCount() - started)
+    screen_ms[step] = (screen_ms[step] or 0) + (clock_ms() - started)
 end
 local function counted(what) screen_counts[what] = (screen_counts[what] or 0) + 1 end
 
@@ -467,7 +470,7 @@ end
 -- after picks them up; it's made again straight away while any wait.
 local function make_wanted(copies, budget_ends)
     for t in pairs(state.wanted) do
-        if dfhack.getTickCount() >= budget_ends then return end
+        if clock_ms() >= budget_ends then return end
         state.wanted[t] = nil
         if copies[t] == nil then make_screen_copy(t, copies) end
     end
@@ -545,7 +548,7 @@ local function plan_cell(plan, depth, name, background, t, x, y, z, now, budget_
         end
     end
     if copy == nil then
-        if dfhack.getTickCount() < budget_ends then
+        if clock_ms() < budget_ends then
             copy = make_screen_copy(t, copies)
             checked[t] = true
         else
@@ -590,7 +593,7 @@ local function plan_screen(viewport, key, budget_ends)
     local port = viewport_at(depth)
     local cols = math.min(viewport.x2 - viewport.x1 + 1, port.dim_x)
     local rows = math.min(viewport.y2 - viewport.y1 + 1, port.dim_y)
-    local now, z = dfhack.getTickCount(), viewport.z - depth
+    local now, z = clock_ms(), viewport.z - depth
     local name = 'screentexpos_' .. layer
     local values, background = port[name], layer == 'background'
     for sx = 0, cols - 1 do
@@ -634,33 +637,69 @@ local function strip_positions(cols, rows, moved_x, moved_y)
     return positions
 end
 
+-- A plan's cells that are still in view, as a new list (a kept level's plan may be the same table).
+local function cells_in_view(plan, viewport)
+    local x1, y1, x2, y2 = viewport.x1, viewport.y1, viewport.x2, viewport.y2
+    local kept = {}
+    for _, cell in ipairs(plan) do
+        local x, y = cell[3], cell[4]
+        if x >= x1 and x <= x2 and y >= y1 and y <= y2 then kept[#kept + 1] = cell end
+    end
+    return kept
+end
+
+-- A plan with a newly shown strip's cells added. The cells a pan takes out of view are dropped,
+-- but not on every frame of the pan (making the list again each time cost as much as walking the
+-- cells out of view did): only once the plan has grown by half since it was last tidied.
+local TIDY_GROWTH = 1.5
+local tidy_from = setmetatable({}, {__mode = 'k'})   -- plan -> the length from which it's tidied
+local function with_strip(plan, strip_cells, viewport)
+    if #plan + #strip_cells >= (tidy_from[plan] or 0) then
+        plan = cells_in_view(plan, viewport)
+        tidy_from[plan] = math.max(1000, (#plan + #strip_cells) * TIDY_GROWTH)
+    end
+    for _, cell in ipairs(strip_cells) do plan[#plan + 1] = cell end
+    return plan
+end
+
 -- After a pan: the cells just come into view, every layer and level, planned in this frame (the
--- rest of the plan is by map position, so it carries on as it was). Added to the plan being drawn,
--- and to one being made, if any.
+-- rest of the plan is by map position, so it carries on as it was), and the cells the pan took out
+-- of view dropped. Both for the plan being drawn and for one being made, if any.
+-- (The cells out of view used to stay until the next whole plan was done, and the plan being made
+-- got the new strip's cells twice, once from here and once from its own later passes: panning
+-- through woodland, a plan of some 2,300 cells grew to 12,000, all walked every frame.)
 local function plan_new_strip(viewport, key, old_x1, old_y1, budget_ends)
     local copies = state.screen_copies[key]
-    local added = {}
-    local checked = state.screen_scan and state.screen_scan.checked or {}
-    local now = dfhack.getTickCount()
+    local scan = state.screen_scan
+    local added = {}            -- for the plan being drawn: the strip's cells in every layer
+    local added_to_scan = {}    -- for the plan being made: only in the layers it has already passed
+    local checked = scan and scan.checked or {}
+    local now = clock_ms()
     for depth = 0, SCREEN_DEPTHS - 1 do
         local port = viewport_at(depth)
         local cols = math.min(viewport.x2 - viewport.x1 + 1, port.dim_x)
         local rows = math.min(viewport.y2 - viewport.y1 + 1, port.dim_y)
         local positions = strip_positions(cols, rows, viewport.x1 - old_x1, viewport.y1 - old_y1)
         local z = viewport.z - depth
-        for _, layer in ipairs(SCREEN_LAYERS) do
+        for layer_index, layer in ipairs(SCREEN_LAYERS) do
             local name = 'screentexpos_' .. layer
             local values, background = port[name], layer == 'background'
+            local first_added = #added + 1
             for i = 1, #positions, 2 do
                 local sx, sy = positions[i], positions[i + 1]
                 plan_cell(added, depth, name, background, values[sx * port.dim_y + sy],
                     viewport.x1 + sx, viewport.y1 + sy, z, now, budget_ends, copies, checked)
             end
+            -- (plan_screen's passes go a layer of a level at a time, in this same order; a pass
+            -- still to come will find the strip's cells itself)
+            local pass = depth * #SCREEN_LAYERS + layer_index - 1
+            if scan and pass < scan.next then
+                for i = first_added, #added do added_to_scan[#added_to_scan + 1] = added[i] end
+            end
         end
     end
-    for _, list in ipairs({state.screen_plan, state.screen_scan and state.screen_scan.plan}) do
-        if list then for _, cell in ipairs(added) do list[#list + 1] = cell end end
-    end
+    if state.screen_plan then state.screen_plan = with_strip(state.screen_plan, added, viewport) end
+    if scan then scan.plan = with_strip(scan.plan, added_to_scan, viewport) end
 end
 
 -- Each frame: writes the planned copies, where the cell still shows what was planned. A cell
@@ -668,7 +707,6 @@ end
 -- sails) shows a different picture each frame, and only swapping the one seen when planned made
 -- it flash between the look and the game's own colours.
 local function apply_screen(viewport)
-    local buffers, dims = {}, {}
     local copies = state.screen_copies and state.screen_copies[state.shown] or {}
     local screen_original = state.screen_original or {}
     local sway = state.sway
@@ -676,23 +714,23 @@ local function apply_screen(viewport)
     local x1, y1 = viewport.x1, viewport.y1
     local cols = viewport.x2 - viewport.x1 + 1
     local rows = viewport.y2 - viewport.y1 + 1
+    -- The buffer being written and its size, looked up when a cell is of another level or layer
+    -- than the one before: the plan is made a layer of a level at a time, so its cells come in long
+    -- runs of the same buffer. (Each cell used to find its buffer by a name built from its level
+    -- and layer, and building that string cost more than everything else done for the cell.)
+    local buffer_depth, buffer_layer, values
+    local shown_cols, shown_rows, buffer_rows = 0, 0, 0
     for _, cell in ipairs(state.screen_plan or {}) do
-        local depth = cell[1]
-        local dim = dims[depth]
-        if not dim then
+        local depth, layer = cell[1], cell[2]
+        if depth ~= buffer_depth or layer ~= buffer_layer then
             local port = viewport_at(depth)
-            dim = {math.min(cols, port.dim_x), math.min(rows, port.dim_y), port.dim_y}
-            dims[depth] = dim
+            buffer_depth, buffer_layer, values = depth, layer, port[layer]
+            -- raw memory: never past the buffer's end (just after a zoom the viewport can be larger)
+            shown_cols, shown_rows, buffer_rows = math.min(cols, port.dim_x), math.min(rows, port.dim_y), port.dim_y
         end
         local sx, sy = cell[3] - x1, cell[4] - y1
-        if sx >= 0 and sy >= 0 and sx < dim[1] and sy < dim[2] then
-            local name = depth .. cell[2]
-            local values = buffers[name]
-            if not values then
-                values = viewport_at(depth)[cell[2]]
-                buffers[name] = values
-            end
-            local i = sx * dim[3] + sy
+        if sx >= 0 and sy >= 0 and sx < shown_cols and sy < shown_rows then
+            local i = sx * buffer_rows + sy
             local t = values[i]
             -- (a cell the game hasn't redrawn still shows a copy or sway frame of it)
             if t == cell[5] or (t ~= 0 and screen_original[t] == cell[5]) then
@@ -905,7 +943,7 @@ local function wanted_lean()
     local wx, wy, strength = wind.get()
     if strength < LEAN_BREEZE_FROM then return 0 end
     -- game time: still when paused
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     if lean_state.last and not df.global.pause_state then
         lean_state.clock = lean_state.clock + math.min(100, now - lean_state.last) / 1000
     end
@@ -1036,7 +1074,7 @@ end
 -- together overran the frame's budget). True once they're all made.
 local function build_lean(l, started, budget)
     local copies = state.copies[l.look] or {}
-    while l.position <= #l.grass and dfhack.getTickCount() - started < budget do
+    while l.position <= #l.grass and clock_ms() - started < budget do
         local original = l.grass[l.position]
         local job = l.job
         if not job or job.original ~= original then
@@ -1113,7 +1151,7 @@ local function update_lean(key, look_complete, started, budget)
     end
     -- (with the gust's sweep on screen, as the middle of the view: grass_wave)
     if wave_mode ~= 'off' and l.reach_s and not state.lean_turning then amount = lean_ago(l.reach_s) end
-    local target, now = amount * LEAN_STEPS, dfhack.getTickCount()
+    local target, now = amount * LEAN_STEPS, clock_ms()
     if math.abs(target - l.shown) >= LEAN_HYSTERESIS and now >= (l.next_step or 0) then
         show_lean(key, l.shown + (target > l.shown and 1 or -1))
         l.next_step = now + LEAN_STEP_MS
@@ -1269,7 +1307,8 @@ local function update_sway(key)
         state.sway = sway
     end
     local copies = state.screen_copies and state.screen_copies[key] or {}
-    local started, ready = dfhack.getTickCount(), true
+    local started, ready = clock_ms(), true
+    local sway_ms   -- taken from the frame's work time when the first frame needs making
     for _, cell in ipairs(state.screen_plan or {}) do
         local original = cell[5]
         local copy = copies[original]
@@ -1305,7 +1344,8 @@ local function update_sway(key)
                 sway.job = job
             end
             while job.phase <= RUSTLE_PHASES do
-                if dfhack.getTickCount() - started >= SWAY_MS * screen_allowance then ready = false break end
+                sway_ms = sway_ms or work_time.take(SWAY_MS * screen_allowance)
+                if clock_ms() - started >= sway_ms then ready = false break end
                 local frame = job.px and rustle_frame(job.px, job.phase - 1, kind, sway) or false
                 if frame then
                     state.ours[frame.texpos] = true
@@ -1323,7 +1363,7 @@ local function update_sway(key)
     -- the loop plays at the gust's pace (a gale's never stops); still until every frame is made,
     -- so the canopy starts as one
     local pace = kind == 'gale' and 1 or kind == 'strong' and 0.7 or amount / LEAN_BREEZE_MOST
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     local dt = sway.last and math.min(100, now - sway.last) / 1000 or 0
     sway.last = now
     if not ready or pace <= 0.05 or df.global.pause_state then
@@ -1406,7 +1446,7 @@ local function grass_wave(viewport)
     end
     local playing
     if kind and rustle_grass_mode ~= 'off' then
-        local now = dfhack.getTickCount()
+        local now = clock_ms()
         local dt = l.rustle_last and math.min(100, now - l.rustle_last) / 1000 or 0
         l.rustle_last = now
         local pace = kind == 'gale' and 1 or kind == 'strong' and 0.7 or lean_ago(0) / LEAN_BREEZE_MOST
@@ -1452,9 +1492,9 @@ local function grass_wave(viewport)
         end
     end
     -- the rustle frames still wanted, a few a frame
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     for k in pairs(wanted) do
-        if dfhack.getTickCount() - started >= GRASS_RUSTLE_MS then break end
+        if clock_ms() - started >= GRASS_RUSTLE_MS then break end
         wanted[k] = nil
         local phase, even, original = k % 64, (k // 64) % 16, k // 1024
         local base = even > 0 and l.frames[original] and l.frames[original][even]
@@ -1496,7 +1536,7 @@ local function screen_ready(key, look, started, budget)
         local kept = set[t]
         local out_of_date = old and kept and kept.hash ~= old.hash
         if old and (kept == nil or out_of_date) then
-            if dfhack.getTickCount() - started >= budget then return false end
+            if clock_ms() - started >= budget then return false end
             if out_of_date then
                 discard(kept.handle, 'tree and building copies')
                 state.screen_original[kept.texpos] = nil
@@ -1595,7 +1635,7 @@ function update(viewport)
     frame_number = frame_number + 1
     grass.empty_trash()
     if not state then state = find_refs() end
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     if mode == 'off' then
         if state.shown then show(nil) forget_screen(nil) end
         return
@@ -1636,11 +1676,11 @@ function update(viewport)
             state.remaking[key] = remaking
         end
     end
-    local started = dfhack.getTickCount()
-    local budget = state.shown and BUILD_MS_PER_FRAME or FIRST_BUILD_MS
+    local started = clock_ms()
+    local budget = work_time.take(state.shown and BUILD_MS_PER_FRAME or FIRST_BUILD_MS)
     -- the sheet's partly see-through textures, remade, before the look shows
     local remaking = state.remaking[key]
-    while remaking and #remaking > 0 and dfhack.getTickCount() - started < budget do
+    while remaking and #remaking > 0 and clock_ms() - started < budget do
         local item = table.remove(remaking)
         set[item[1]] = unpremultiplied(item[2])
     end
@@ -1648,7 +1688,7 @@ function update(viewport)
     state.built = state.built or {}
     local position = state.built[key] or 1
     local originals = state.originals
-    while position <= #originals and dfhack.getTickCount() - started < budget do
+    while position <= #originals and clock_ms() - started < budget do
         local original = originals[position]
         if not set[original] then set[original] = redrawn_copy(original, look) end
         -- once the look is showing, things seen later are swapped in as their copies are made
@@ -1692,6 +1732,12 @@ function update(viewport)
     if next_lean and next_lean.look == key then take_over_lean(key, next_lean, step) end
 end
 
+-- The clock time at which work starting now must stop: wanted_ms on, or sooner when the frame's
+-- shared work time is short.
+local function ends_after(wanted_ms)
+    return clock_ms() + work_time.take(wanted_ms)
+end
+
 -- The per-tile swaps on screen. Called last in the frame, after the snow and frost have written
 -- theirs: they then always see the game's own textures, and this shifts whatever ends up showing
 -- (fruit the snow lifted above it, say), leaving their own textures be.
@@ -1707,7 +1753,7 @@ function update_screen(viewport)
         grass_wave(viewport)   -- the grass's gusts and rustle don't depend on the trees' swaps
         return
     end
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     state.screen_copies = state.screen_copies or {}
     if not state.screen_copies[key] then
         state.screen_copies[key] = {}
@@ -1723,7 +1769,7 @@ function update_screen(viewport)
     -- a pan: the plan's by map position, so only the strip just come into view needs planning,
     -- this frame
     local view = state.screen_view
-    local step_started = dfhack.getTickCount()
+    local step_started = clock_ms()
     if new_level then
         counted('level changes')
         -- back on a level seen lately: its plan again at once, and a new one made in the
@@ -1737,7 +1783,8 @@ function update_screen(viewport)
         end
     end
     if not new_level and state.screen_plan and view and (view[1] ~= viewport.x1 or view[2] ~= viewport.y1) then
-        plan_new_strip(viewport, key, view[1], view[2], dfhack.getTickCount() + BUILD_MS_PER_FRAME * screen_allowance)
+        plan_new_strip(viewport, key, view[1], view[2], ends_after(BUILD_MS_PER_FRAME * screen_allowance))
+        work_time.done()
         clocked('planning the strip a pan brought in', step_started)
     end
     state.screen_view = {viewport.x1, viewport.y1}
@@ -1748,29 +1795,32 @@ function update_screen(viewport)
     end
     -- many at once (the trees all changing as their leaves fall): faster, for a moment
     if waiting then
-        step_started = dfhack.getTickCount()
+        step_started = clock_ms()
         make_wanted(state.screen_copies[key],
-            dfhack.getTickCount() + (count > BUSY_FROM and BUSY_BUILD_MS or BUILD_MS_PER_FRAME) * screen_allowance)
+            ends_after((count > BUSY_FROM and BUSY_BUILD_MS or BUILD_MS_PER_FRAME) * screen_allowance))
+        work_time.done()
         clocked('making copies that were waiting', step_started)
     end
-    step_started = dfhack.getTickCount()
+    step_started = clock_ms()
     if state.screen_scan or now >= (state.next_screen_plan or 0) or new_level then
         repeat
-            local finished = plan_screen(viewport, key, dfhack.getTickCount() + BUILD_MS_PER_FRAME * screen_allowance)
+            local finished = plan_screen(viewport, key, ends_after(BUILD_MS_PER_FRAME * screen_allowance))
+            work_time.done()
             if finished then
                 -- straight away again while copies wait (they show once a plan has them)
                 state.next_screen_plan = (waiting or next(state.wanted)) and now or now + SCREEN_PLAN_MS
             end
-        until finished or not new_level or dfhack.getTickCount() - now >= NEW_LEVEL_PLAN_MS
+        until finished or not new_level or clock_ms() - now >= NEW_LEVEL_PLAN_MS
     end
     clocked('planning the view', step_started)
-    step_started = dfhack.getTickCount()
+    step_started = clock_ms()
     if sway_mode == 'on' then update_sway(key) else state.sway = nil end
+    work_time.done()
     clocked('tree sway frames', step_started)
-    step_started = dfhack.getTickCount()
+    step_started = clock_ms()
     apply_screen(viewport)
     clocked('writing the copies to the screen', step_started)
-    step_started = dfhack.getTickCount()
+    step_started = clock_ms()
     grass_wave(viewport)
     clocked('grass wave and rustle', step_started)
 end
@@ -1794,7 +1844,7 @@ end
 -- The screen cells (this level) that are underground, worked out again when the view moves and
 -- every UNDERGROUND_MASK_MS (a pan's new cells are known the frame they show).
 local function underground_cells(viewport, port)
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     local m = state.underground_mask
     if m and m.x == viewport.x1 and m.y == viewport.y1 and m.z == viewport.z and m.dim_x == port.dim_x
             and m.dim_y == port.dim_y and now < m.due then

@@ -18,6 +18,8 @@
 -- 1 strong, up to 1.5 a gale.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local GRID_RADIUS = 10        -- world tiles each side of the fort: a 21 x 21 grid
 -- world tiles the clouds can be found to have moved in an hour: they move a tile at a time, and
 -- 2-tile 'moves' were the field reforming (mostly east, against the drift)
@@ -136,7 +138,7 @@ function update()
         state.last_hour = hour
         hourly()
     end
-    local clock = dfhack.getTickCount()
+    local clock = clock_ms()
     local seconds = state.last_clock and math.min(clock - state.last_clock, 500) / 1000 or 0
     state.last_clock = clock
     local target = state.forced or state.target

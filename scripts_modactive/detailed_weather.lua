@@ -154,6 +154,8 @@ Examples
 --   detailed_weather reload           reload the art, e.g. after rebuilding it
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local overlay = require('plugins.overlay')
 local guidm = require('gui.dwarfmode')
 
@@ -198,6 +200,7 @@ local paths = reqscript('internal/detailed_weather/paths')
 local spatter = reqscript('internal/detailed_weather/spatter')
 local murky = reqscript('internal/detailed_weather/murky')
 local leaves = reqscript('internal/detailed_weather/leaves')
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
 
 ----------------------------------------------------------------------------------------------
 -- Art
@@ -280,16 +283,16 @@ local function sheet_of(name)
 end
 
 -- A group's textures (by place in its file), or nil while the file waits its turn to load.
-local sheet_loaded_at = nil   -- when the last file finished loading (dfhack.getTickCount)
+local sheet_loaded_at = nil   -- when the last file finished loading (clock_ms)
 local function sheet_tiles(sheet, group)
     local tiles = sheet.groups[group]
     if not tiles then
         -- (timed from the end of a load: from its start, a load longer than the wait let the next
         -- file asked for in the same frame straight through)
-        if sheet_loaded_at and dfhack.getTickCount() - sheet_loaded_at < 100 then return nil end
+        if sheet_loaded_at and clock_ms() - sheet_loaded_at < 100 then return nil end
         tiles = dfhack.textures.loadTileset(art_path(('falling/%s-%d.png'):format(sheet.name, group)), 32, 32, true)
         sheet.groups[group] = tiles
-        sheet_loaded_at = dfhack.getTickCount()
+        sheet_loaded_at = clock_ms()
     end
     return tiles
 end
@@ -370,31 +373,82 @@ local function is_water(flags)
     return flags and flags.flow_size > 0 and not flags.liquid_type
 end
 
--- Outdoor tiles in view where it's raining or snowing, with which, and whether it lands on ground
--- or water. The weather is the same across a map block, so it's looked up once per block.
-local function find_rain(viewport)
+-- Where rain or snow can land in one map block (16 x 16 tiles): its outdoor, revealed tiles, each
+-- {x =, y =, surface = GROUND or WATER}. Reading a block's tiles from the game is the slow part of
+-- finding the rain (some 4 ms for a view's worth), so each block read is kept: by block and level,
+-- for FALL_BLOCK_KEEP_MS, as digging, building and freezing change it only slowly.
+local FALL_BLOCK_KEEP_MS = 5000
+local FALL_BLOCKS_MOST = 200         -- kept at most; past this they're all let go and read again
+local STALE_BLOCKS_PER_SCAN = 2      -- old blocks read again in one scan (the rest wait, used as they are)
+local fall_blocks, fall_block_count = {}, 0   -- block key -> {tiles =, read_at = clock ms}
+local fall_blocks_map                         -- which map they're of (map_name)
+
+local function forget_fall_blocks() fall_blocks, fall_block_count = {}, 0 end
+
+-- The map loaded, by save and place in its world: what's kept of one map mustn't be used on the
+-- next. (Checked here as well as dropped at unload: the unload handler belongs to whichever copy of
+-- this script ran last, the overlay's or a command's, and each has its own kept blocks.)
+local function map_name()
+    local map = df.global.world.map
+    return dfhack.world.ReadWorldFolder() .. ':' .. map.region_x .. ',' .. map.region_y
+end
+
+local function read_fall_block(block_x, block_y, z, now)
     local tiles = {}
-    local z = viewport.z
-    for block_y = viewport.y1 - viewport.y1 % 16, viewport.y2, 16 do
-        for block_x = viewport.x1 - viewport.x1 % 16, viewport.x2, 16 do
-            local block = dfhack.maps.getTileBlock(block_x, block_y, z)
-            local weather = block and weather_at(block_x + 8, block_y + 8, z)
+    local block = dfhack.maps.getTileBlock(block_x, block_y, z)
+    if block then
+        local below = dfhack.maps.getTileBlock(block_x, block_y, z - 1)
+        local EMPTY = df.tiletype_shape.EMPTY
+        for dx = 0, 15 do
+            local designations, tiletypes = block.designation[dx], block.tiletype[dx]
+            local designations_below = below and below.designation[dx]
+            for dy = 0, 15 do
+                local flags = designations[dy]
+                if flags.outside and not flags.hidden then
+                    -- on water, or falling through open air onto water just below
+                    local onto_water = is_water(flags) or (designations_below
+                        and shape_of(tiletypes[dy]) == EMPTY and is_water(designations_below[dy]))
+                    tiles[#tiles + 1] = {x = block_x + dx, y = block_y + dy, surface = onto_water and WATER or GROUND}
+                end
+            end
+        end
+    end
+    return {tiles = tiles, read_at = now}
+end
+
+-- Outdoor tiles in view where it's raining or snowing, with which (tile.weather), and whether it
+-- lands on ground or water. The weather is the same across a map block, so it's looked up once per
+-- block. A pan only reads the blocks it brings into view: the rest are as kept. (All read again on
+-- every frame the view moved, as they first were, this was a third of the mod's time while panning
+-- in rain or snow.) The tiles returned are the kept ones themselves, not copies.
+local function find_rain(viewport)
+    local now = clock_ms()
+    local map = map_name()
+    if map ~= fall_blocks_map or fall_block_count > FALL_BLOCKS_MOST then
+        forget_fall_blocks()
+        fall_blocks_map = map
+    end
+    local tiles = {}
+    local x1, y1, x2, y2, z = viewport.x1, viewport.y1, viewport.x2, viewport.y2, viewport.z
+    local stale_reads_left = STALE_BLOCKS_PER_SCAN
+    for block_y = y1 - y1 % 16, y2, 16 do
+        for block_x = x1 - x1 % 16, x2, 16 do
+            local weather = weather_at(block_x + 8, block_y + 8, z)
             if weather then
-                local below = dfhack.maps.getTileBlock(block_x, block_y, z - 1)
-                for dx = 0, 15 do
-                    for dy = 0, 15 do
-                        local x, y = block_x + dx, block_y + dy
-                        local flags = block.designation[dx][dy]
-                        if flags.outside and not flags.hidden
-                                and x >= viewport.x1 and x <= viewport.x2 and y >= viewport.y1 and y <= viewport.y2 then
-                            local shape = shape_of(block.tiletype[dx][dy])
-                            local surface = GROUND
-                            if is_water(flags) or (shape == df.tiletype_shape.EMPTY and below
-                                    and is_water(below.designation[dx][dy])) then
-                                surface = WATER
-                            end
-                            tiles[#tiles + 1] = {x = x, y = y, surface = surface, weather = weather}
-                        end
+                local key = (z * 4096 + block_x) * 4096 + block_y
+                local kept = fall_blocks[key]
+                local stale = kept and now - kept.read_at > FALL_BLOCK_KEEP_MS
+                if not kept or (stale and stale_reads_left > 0) then
+                    if stale then stale_reads_left = stale_reads_left - 1 else fall_block_count = fall_block_count + 1 end
+                    kept = read_fall_block(block_x, block_y, z, now)
+                    fall_blocks[key] = kept
+                end
+                -- a block at the view's edge is only partly in it
+                local all_in_view = block_x >= x1 and block_x + 15 <= x2 and block_y >= y1 and block_y + 15 <= y2
+                for _, tile in ipairs(kept.tiles) do
+                    if all_in_view or (tile.x >= x1 and tile.x <= x2 and tile.y >= y1 and tile.y <= y2) then
+                        tile.weather = weather
+                        tiles[#tiles + 1] = tile
                     end
                 end
             end
@@ -415,7 +469,7 @@ local fog_wanted, fog_wanted_since, fog_stepped = nil, 0, 0
 local function fog_level()
     if fog_mode == 'off' then fog_shown = 0 return 0 end
     if fog_mode ~= 'auto' then fog_shown = tonumber(fog_mode) or 0 return fog_shown end
-    local game, now = fort_world_tile().clouds.fog, dfhack.getTickCount()
+    local game, now = fort_world_tile().clouds.fog, clock_ms()
     if not fog_shown then fog_shown = game end   -- (a fort just loaded: as it is)
     if game ~= fog_wanted then fog_wanted, fog_wanted_since = game, now end
     if fog_shown ~= game and now - fog_wanted_since >= FOG_SETTLE_MS and now - fog_stepped >= FOG_STEP_MS then
@@ -435,7 +489,7 @@ local FOG_MOST_DEPTH = 8
 local FOG_FORGET_MS = 30000
 fog_memory = fog_memory or {tiles = {}, count = 0, forget_at = 0}
 local function find_outdoors(viewport)
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     if now >= fog_memory.forget_at or fog_memory.count > 60000 then
         fog_memory.tiles, fog_memory.count, fog_memory.forget_at = {}, 0, now + FOG_FORGET_MS
     end
@@ -523,6 +577,7 @@ dfhack.onStateChange.detailed_weather = function(event)
     -- the texture numbers of what the modules made (all made again for the next world) would
     -- name the next world's own pictures, which would then be passed over as ours
     for texpos in pairs(_G.detailed_weather_made or {}) do _G.detailed_weather_made[texpos] = nil end
+    forget_fall_blocks()
     grass.forget_world()
     snow_ramps.forget_world()
     frost.forget_world()
@@ -585,6 +640,7 @@ function apply_settings()
     if changed('paths') then paths.plans = {} end
     if changed('shade') then shade.plan = nil end
     for _, part in ipairs(settings.PARTS) do applied_settings[part.name] = level(part.name) end
+    stage_rests = {}   -- a part that kept failing gets a fresh try with the new settings
 end
 -- (Every time this file runs, as the overlay's module or for a command: handing out the same
 -- settings twice changes nothing.)
@@ -632,10 +688,10 @@ function RainOverlay:onRenderFrame(dc)
     if not map_drawn then return end
     map_drawn = false
     if not dfhack.screen.inGraphicsMode() or not dfhack.isMapLoaded() then return end
-    local frame_started = dfhack.getTickCount()
+    local frame_started = clock_ms()
     self.parts = {}
     self:draw_weather(dc)
-    local took = dfhack.getTickCount() - frame_started
+    local took = clock_ms() - frame_started
     profile.frames = profile.frames + 1
     profile.average = profile.average + (took - profile.average) * 0.05
     if took > profile.worst then profile.worst, profile.worst_parts = took, table.concat(self.parts, ' ') end
@@ -648,16 +704,41 @@ function RainOverlay:note(what) self.parts[#self.parts + 1] = what end
 -- A stage that fails doesn't stop the ones after it: an error in the grass's rustle once left the
 -- rain, fog, shade and leaves undrawn too, and wrote the same error to the log every frame. Each
 -- different failure is reported once, and listed by `detailed_weather`.
+--
+-- A stage that has just failed rests before it's tried again, twice as long after each failure in
+-- a row (a second, two, four... up to a minute): tried again every frame, one that makes textures
+-- before it fails would make them sixty times a second, and none are ever deleted (grass.lua).
+-- One success ends it. The rests are forgotten when a setting changes (apply_settings) and on a
+-- new map, so each gets a fresh try.
 stage_errors = stage_errors or {}   -- 'stage: message' -> how many times
+stage_rests = {}                    -- stage -> {failures = in a row, retry_at = clock ms}
+local FIRST_REST_MS, LONGEST_REST_MS = 1000, 60000
+
+local function rest_after_failure(name, now)
+    local rest = stage_rests[name] or {failures = 0}
+    rest.failures = rest.failures + 1
+    -- (the doubling stops at 2^16: past the longest rest long before)
+    local wait = math.min(LONGEST_REST_MS, FIRST_REST_MS * 2 ^ math.min(rest.failures - 1, 16))
+    rest.retry_at = now + wait
+    stage_rests[name] = rest
+end
+
 function RainOverlay:timed(name, fn, ...)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
+    local rest = stage_rests[name]
+    if rest and started < rest.retry_at then return end
+    work_time.start_stage()
     local ok, problem = pcall(fn, ...)
-    if not ok then
+    work_time.done()   -- whatever work the stage left under way ends with it
+    if ok then
+        stage_rests[name] = nil
+    else
         local report = name .. ': ' .. tostring(problem)
         if not stage_errors[report] then dfhack.printerr('detailed_weather: ' .. report) end
         stage_errors[report] = (stage_errors[report] or 0) + 1
+        rest_after_failure(name, clock_ms())
     end
-    local took = dfhack.getTickCount() - started
+    local took = clock_ms() - started
     if took >= 1 then self:note(name .. '=' .. took) end
 end
 
@@ -667,10 +748,12 @@ function RainOverlay:draw_weather(dc)
         self:init()
         self.map_count, self.view_key, self.due = map_count, nil, nil
         self.ramp_tiles, self.frost_tiles, self.weather_key, self.fog = nil, nil, nil, nil
+        stage_rests = {}   -- what failed on the last map may not here
     end
 
     local tick = df.global.cur_year_tick
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
+    work_time.start_frame()
     wind.update()
     self:timed('colour', colour.update, viewport)
     -- the plans are per screen position, so a moved view needs new ones straight away
@@ -702,29 +785,29 @@ function RainOverlay:draw_weather(dc)
         if now >= (self.next_frost_scan or 0) then self.due.frost = true end
     end
     if now >= (self.next_fog_scan or 0) and self.fog and self.fog > 0 then self.due.fog = true end
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     local scan_started = started
     local scanned_rain = self.due.rain
     if self.due.rain then
         self:note('rain-scan')
         self.tiles, self.due.rain = find_rain(viewport), nil
-        scan_ms.rain = scan_ms.rain + (dfhack.getTickCount() - started - scan_ms.rain) * 0.2
+        scan_ms.rain = scan_ms.rain + (clock_ms() - started - scan_ms.rain) * 0.2
     end
     -- a moved view's fog can't wait its turn behind the rain: while panning the rain was due every
     -- frame, so the fog stayed on the old view's tiles and the strip panned in came in bare,
     -- fogging over only once the view stopped (a player's report)
     if self.due.fog and (view_moved or not scanned_rain) then
         self:note('fog-scan')
-        local fog_started = dfhack.getTickCount()   -- not `started`: the rain's scan may have run since
+        local fog_started = clock_ms()   -- not `started`: the rain's scan may have run since
         self.fog_tiles = (self.fog or 0) > 0 and find_outdoors(viewport) or {}
         self.due.fog, self.next_fog_scan = nil, now + FOG_RESCAN_MS
-        scan_ms.fog = scan_ms.fog + (dfhack.getTickCount() - fog_started - scan_ms.fog) * 0.2
+        scan_ms.fog = scan_ms.fog + (clock_ms() - fog_started - scan_ms.fog) * 0.2
     end
     -- Snow and frost keep what they've worked out per map tile, and plan a little every frame
     -- within their own time budgets (new strips first, then rechecks, then round the view).
     if ramps_mode == 'on' then self:timed('snow-plan', function() self.ramp_tiles = snow_ramps.plan(viewport) end) end
     if frost_mode == 'on' then self:timed('frost-plan', function() self.frost_tiles = frost.plan(viewport) end) end
-    if dfhack.getTickCount() - scan_started >= 1 then self:note('scan=' .. (dfhack.getTickCount() - scan_started)) end
+    if clock_ms() - scan_started >= 1 then self:note('scan=' .. (clock_ms() - scan_started)) end
 
     -- the animations run on game time, so they stop when the game is paused; but adventure mode's
     -- time only moves as the adventurer acts, which left the rain hanging in the air between turns
@@ -832,7 +915,7 @@ function RainOverlay:draw_weather(dc)
     end
 
     if #self.fog_tiles > 0 and (self.fog or 0) > 0 then
-        local started = dfhack.getTickCount()
+        local started = clock_ms()
         local fog_layout = art.fog_layout
         -- The fog moves on real time, at a steady speed set by the wind, and stands still while
         -- the game is paused. Its position builds up frame by frame, so a change of wind changes
@@ -866,8 +949,8 @@ function RainOverlay:draw_weather(dc)
                 end
             end
         end
-        fog_ms = fog_ms + (dfhack.getTickCount() - started - fog_ms) * 0.05
-        if dfhack.getTickCount() - started >= 1 then self:note('fog-draw=' .. (dfhack.getTickCount() - started)) end
+        fog_ms = fog_ms + (clock_ms() - started - fog_ms) * 0.05
+        if clock_ms() - started >= 1 then self:note('fog-draw=' .. (clock_ms() - started)) end
     end
 
     dc:map(false)
@@ -985,7 +1068,7 @@ function TileInfoOverlay:onRenderFrame(dc)
     end
     local pos = dfhack.gui.getMousePos()
     if not pos then return end
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     if now >= (self.next_find or 0) then
         self.box_left, self.box_last = find_hover_box(dc.width)
         self.next_find = now + HOVER_FIND_MS
@@ -1155,6 +1238,10 @@ local function show_summary()
     for report, count in pairs(module.stage_errors) do
         print(('  A part failed %d time%s: %s'):format(count, count == 1 and '' or 's', report))
     end
+    for name, rest in pairs(module.stage_rests) do
+        print(('  %s is resting after %d failure%s in a row; it is tried again every so often.'):format(
+            name, rest.failures, rest.failures == 1 and '' or 's'))
+    end
     print('"detailed_weather settings" for what\'s on; "help detailed_weather" for commands.')
 end
 
@@ -1186,6 +1273,11 @@ local function show_details()
     print(('  fog %s (at the fort now: %s), drawing %.2f ms a frame'):format(module.fog_mode,
         dfhack.isMapLoaded() and df.fog_type[fort_world_tile().clouds.fog] or '-', module.fog_ms))
     print(('  rescans (4 a second): rain %.1f ms, fog %.1f ms'):format(module.scan_ms.rain, module.scan_ms.fog))
+    -- the shared time for planning and making textures (work_time.lua), since the last `details`
+    local work = work_time.stats
+    print(('  background work: %.2f ms a frame of the %d shared; all used in %d of %d frames'):format(
+        work.work_ms / math.max(1, work.frames), work_time.POOL_MS, work.used_up, work.frames))
+    work.frames, work.used_up, work.work_ms = 0, 0, 0
     print('  colour: ' .. colour.describe())
     print('  shade ' .. shade.describe())
     print('  spatter in the grass ' .. spatter.describe())

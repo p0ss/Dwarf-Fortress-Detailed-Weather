@@ -13,6 +13,8 @@
 -- swapping grass textures, in colour.lua.)
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 -- The corners of a tile, with the two sides (S, W, E, N: floor_flag's byte order) each sits between.
 CORNERS = {
     {name = 'NW', dx = -1, dy = -1, sides = {2, 4}},
@@ -41,14 +43,21 @@ function page_texpos(token, x, y)
 end
 
 -- Mod paths are relative to the user data folder (installed mods) or the game folder (vanilla).
+-- The files' names are asked for without the folder in front (listdir_recursive's include_prefix)
+-- and joined to it here. They used to be asked for with it, and a name was taken as whole only if
+-- it began with '/': on Windows none does (C:/...), so every name came out with the folder twice,
+-- no graphics file was ever opened, and everything read from them was missing there: grass and
+-- ground edge art, snowy edges, and the texture names the ground's classes come from (found and
+-- fixed on Windows by grungeisdead). A root without a closing slash gets one.
 function graphics_files(mod_path)
     local dir
     for _, root in ipairs{dfhack.filesystem.getBaseDir(), dfhack.filesystem.getInstallDir(), ''} do
-        if dfhack.filesystem.isdir(root .. mod_path) then dir = root .. mod_path:gsub('/$', '') .. '/graphics' break end
+        local at = (root == '' or root:match('[/\\]$')) and root .. mod_path or root .. '/' .. mod_path
+        if dfhack.filesystem.isdir(at) then dir = at:gsub('[/\\]$', '') .. '/graphics' break end
     end
     local files = {}
-    for _, f in ipairs(dir and dfhack.filesystem.listdir_recursive(dir) or {}) do
-        local path = f.path:sub(1, 1) == '/' and f.path or dir .. '/' .. f.path
+    for _, f in ipairs(dir and dfhack.filesystem.listdir_recursive(dir, 10, false) or {}) do
+        local path = dir .. '/' .. f.path:gsub('^[/\\]+', '')
         if not f.isdir and path:lower():match('%.txt$') then files[#files + 1] = path end
     end
     table.sort(files)
@@ -408,8 +417,8 @@ function empty_trash()
         texture_trash = {}
         return
     end
-    local started = dfhack.getTickCount()
-    while #texture_trash > 0 and dfhack.getTickCount() - started < TRASH_MS do
+    local started = clock_ms()
+    while #texture_trash > 0 and clock_ms() - started < TRASH_MS do
         dfhack.textures.deleteHandle(table.remove(texture_trash))
     end
 end

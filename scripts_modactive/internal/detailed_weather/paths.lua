@@ -25,6 +25,8 @@
 -- the blocks coming into view; planning stops at PLAN_MS a frame and carries on the next.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local WORN_BELOW = 70          -- grass amount under which a tile shows a track
 local WASH_BELOW = 95          -- and under which it shows the wash
 local WASH_MOST = 0.75         -- the wash's opacity on grass worn right away
@@ -63,6 +65,7 @@ local made = _G.detailed_weather_made
 local grass = reqscript('internal/detailed_weather/grass')   -- texture pixels
 local colour = reqscript('internal/detailed_weather/colour')   -- which textures are dirt
 local frost = reqscript('internal/detailed_weather/frost')     -- the ground under its cracks
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
 
 local GRASS_MATERIALS = {[df.tiletype_material.GRASS_LIGHT] = true, [df.tiletype_material.GRASS_DARK] = true,
                          [df.tiletype_material.GRASS_DRY] = true, [df.tiletype_material.GRASS_DEAD] = true}
@@ -376,10 +379,10 @@ end
 
 -- Works on plan q for at most budget_ms; marks it complete once every block in view is in it.
 local function continue_plan(q, viewport, port, depth, now, budget_ms)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     local top = viewport.z
     local z = top - depth
-    local function out_of_time() return dfhack.getTickCount() - started >= budget_ms end
+    local function out_of_time() return clock_ms() - started >= budget_ms end
     -- a block's grass at level zz (default this plan's): nil if not read and no time to, false if
     -- there's no block there; a stale one is read again when there's time, else used as it is
     local function block_at(bx, by, zz)
@@ -509,8 +512,10 @@ local function draw(p, port, soil_texpos, state)
             local key = base .. ':' .. soil_texpos .. ':' .. cell[4]
             local texpos = baked[key]
             if texpos == nil then
-                state.baking_from = state.baking_from or dfhack.getTickCount()
-                if dfhack.getTickCount() - state.baking_from < BAKE_MS * allowance then
+                if not state.baking_from then
+                    state.baking_from, state.bake_ms = clock_ms(), work_time.take(BAKE_MS * allowance)
+                end
+                if clock_ms() - state.baking_from < state.bake_ms then
                     if grass.delete_textures and baked_count >= BAKED_MOST then clear_cache() end
                     local track = cell[2] and track_mask(cell[2][1], cell[2][2])
                     local px = bake(base, soil_texpos, track, wash_mask(cell[3][1], cell[3][2]))
@@ -536,7 +541,7 @@ soil_original = soil_original or nil   -- the game's dirt texture last found on 
 seen_generation = seen_generation or nil   -- colour.copies_generation when the bakes were made
 function apply(viewport)
     if mode ~= 'on' then return end
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     local planning_left = PLAN_MS * allowance
     local _, look_key = colour.shown_look()
     if soil_look ~= look_key then soil, soil_look = nil, look_key end
@@ -563,9 +568,10 @@ function apply(viewport)
             building = p.next
         end
         if building and planning_left > 0 then
-            local started = dfhack.getTickCount()
-            continue_plan(building, viewport, port, depth, now, planning_left)
-            local took = dfhack.getTickCount() - started
+            local started = clock_ms()
+            continue_plan(building, viewport, port, depth, now, work_time.take(planning_left))
+            work_time.done()
+            local took = clock_ms() - started
             planning_left = planning_left - took
             timing.plan = timing.plan + (took - timing.plan) * 0.2
             if building == p.next and building.complete then
@@ -574,9 +580,9 @@ function apply(viewport)
         end
         if #p.cells > 0 then
             if not soil and depth == 0 then soil = find_soil(port, viewport) end
-            local started = dfhack.getTickCount()
+            local started = clock_ms()
             if soil then draw(p, port, soil, state) end
-            timing.apply = timing.apply + (dfhack.getTickCount() - started - timing.apply) * 0.05
+            timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
         end
     end
 end

@@ -14,6 +14,10 @@
 -- frame, and kept for REMEMBER_MS: water stagnates, drains and fills slowly.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
+
 local TILE = 32
 local CELLS = 4
 local PLAN_MS = 1
@@ -75,14 +79,14 @@ end
 -- seen through open space (a pond is mostly looked down on from the ground beside it).
 function apply(viewport, art_path)
     if mode ~= 'on' then return end
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     if not textures then textures = load_textures(art_path('murky.png')) end
-    local budget_ends = started + PLAN_MS
+    local budget_ends = started + work_time.take(PLAN_MS)
     -- a block's record, read again when it's old if there's time; nil if not read yet
     local function known(bx, by, z)
         local key = block_key(bx, by, z)
         local b = blocks[key]
-        if (not b or started - b.checked > REMEMBER_MS) and dfhack.getTickCount() < budget_ends then
+        if (not b or started - b.checked > REMEMBER_MS) and clock_ms() < budget_ends then
             local block = dfhack.maps.getTileBlock(bx * 16, by * 16, z)
             b = block and read_block(block, started) or {checked = started, tiles = {}, open = {}}
             blocks[key] = b
@@ -123,7 +127,7 @@ function apply(viewport, art_path)
             end
         end
     end
-    timing.apply = timing.apply + (dfhack.getTickCount() - started - timing.apply) * 0.05
+    timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
 end
 
 -- The art loaded again next frame (after `detailed_weather reload`).

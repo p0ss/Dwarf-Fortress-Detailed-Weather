@@ -22,8 +22,11 @@
 -- view moves.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local colour = reqscript('internal/detailed_weather/colour')
 local grass = reqscript('internal/detailed_weather/grass')
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
 
 local BLADES = 0.35            -- the brightest share of a grass's pixels count as blades in front
 local BLADE_SOFT = 0.15        -- share of brightness over which a blade fades in
@@ -262,10 +265,12 @@ function share_for(amount)
 end
 
 -- Whether there's still time this frame to make a texture: BAKE_MS from the first one wanted.
-local bake_started
+local bake_started, bake_ms
 local function time_to_bake()
-    bake_started = bake_started or dfhack.getTickCount()
-    return dfhack.getTickCount() - bake_started < BAKE_MS * allowance
+    if not bake_started then
+        bake_started, bake_ms = clock_ms(), work_time.take(BAKE_MS * allowance)
+    end
+    return clock_ms() - bake_started < bake_ms
 end
 
 -- A texture of these pixels, as a cache entry ({} if there were none to make one from).
@@ -339,7 +344,7 @@ local seen_generation   -- colour.copies_generation the bakes were made with
 -- Every frame, after the colour's swaps: each piece of spatter on grass in view, in the grass.
 function apply(viewport)
     if mode ~= 'on' then return end
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     bake_started = nil
     if seen_generation ~= colour.copies_generation then
         if seen_generation then clear_cache() end
@@ -385,7 +390,7 @@ function apply(viewport)
             end
         end
     end
-    timing.apply = timing.apply + (dfhack.getTickCount() - started - timing.apply) * 0.05
+    timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
 end
 
 function forget_world()

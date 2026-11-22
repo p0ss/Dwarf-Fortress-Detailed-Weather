@@ -15,6 +15,8 @@
 -- so a view with none costs next to nothing.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local STRENGTH = 0.30          -- how much darker the shade is (the shade's opacity): a little lighter
                                -- than a ramp's shadowed side (0.6-0.67 of the flat ground), so a roofed
                                -- building isn't too dark inside
@@ -25,6 +27,8 @@ local BLOCK_KEEP_MS = 30000    -- how long a block's cover is kept
 local READ_MS = 1.5            -- reading blocks: at most this long a frame (the rest wait a frame)
 local REPLAN_MS = 5000
 local TILE = 32
+
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
 
 mode = mode or 'on'
 textures = textures or {}       -- corner key -> texpos (or false)
@@ -84,6 +88,7 @@ end
 -- was read (if not, it's planned again next frame).
 local function make_plan(viewport, port, now)
     local started = now
+    local read_ms = work_time.take(READ_MS)
     local z = viewport.z
     local x1, y1, x2, y2 = viewport.x1 - SPREAD - 1, viewport.y1 - SPREAD - 1, viewport.x2 + SPREAD + 1, viewport.y2 + SPREAD + 1
     -- the blocks round the view: read the missing or stale ones while there's time
@@ -95,7 +100,7 @@ local function make_plan(viewport, port, now)
             local b = blocks[key]
             if not b or now - b.at > BLOCK_KEEP_MS then
                 -- a stale block is used as it was until there's time to read it again
-                if dfhack.getTickCount() - started < READ_MS then
+                if clock_ms() - started < read_ms then
                     local block = dfhack.maps.getTileBlock(bx * 16, by * 16, z)
                     if block then b = read_block(block, now) blocks[key] = b end
                 else
@@ -172,15 +177,16 @@ end
 function apply(viewport)
     if mode ~= 'on' then return end
     local port = df.global.gps.main_viewport
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     local p = plan
     if not p or now >= p.due or p.x1 ~= viewport.x1 or p.y1 ~= viewport.y1 or p.z ~= viewport.z
             or p.dim_x ~= port.dim_x or p.dim_y ~= port.dim_y then
         p = make_plan(viewport, port, now)
+        work_time.done()
         plan = p
-        timing.plan = timing.plan + (dfhack.getTickCount() - now - timing.plan) * 0.2
+        timing.plan = timing.plan + (clock_ms() - now - timing.plan) * 0.2
     end
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     local cells = p.cells
     if #cells > 0 then
         local buffer = port.screentexpos_designation
@@ -189,7 +195,7 @@ function apply(viewport)
             if buffer[i] == 0 then buffer[i] = cells[k + 1] end
         end
     end
-    timing.apply = timing.apply + (dfhack.getTickCount() - started - timing.apply) * 0.05
+    timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
 end
 
 -- Another world: what's kept by position belongs to the old map, and the shade tiles' texture

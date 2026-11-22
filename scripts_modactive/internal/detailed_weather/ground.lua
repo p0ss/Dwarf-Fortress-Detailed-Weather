@@ -23,6 +23,8 @@
 -- Prototyped offline in tools/weather/snow_test.py and temperature_test.py.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local grass = reqscript('internal/detailed_weather/grass')
 
 local TILE = 32
@@ -409,7 +411,7 @@ end
 -- space: its ground texture and what to draw on it. Done every few frames; apply() draws it every
 -- frame, since the game rebuilds its screen layers.
 function plan(viewport)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     local main = df.global.gps.main_viewport
 
     -- Map blocks, and their snow amounts, looked up once each: reading tiles straight from the
@@ -521,7 +523,7 @@ function plan(viewport)
     -- Tiles are remembered by map position for a few seconds (snow and temperature change
     -- slowly), so a replan, or a pan of the view, only works out tiles that are new, changed or
     -- due. Each is due at a slightly different time, so the work is spread out.
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     local backgrounds, floor_flags = {}, {}   -- each depth's screen layers, looked up once
     for depth = 0, MOST_DEPTH do
         local port = viewport_at(depth)
@@ -550,13 +552,13 @@ function plan(viewport)
             end
         end
     end
-    timing.plan = timing.plan + (dfhack.getTickCount() - started - timing.plan) * TIMING_SMOOTHING * 4
+    timing.plan = timing.plan + (clock_ms() - started - timing.plan) * TIMING_SMOOTHING * 4
     return tiles
 end
 
 -- frame: the animation frame, for the shimmer.
 function apply(tiles, frame)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     -- each depth's screen layers, looked up once
     local backgrounds, spatters, floor_flags = {}, {}, {}
     for depth = 0, MOST_DEPTH do
@@ -590,5 +592,5 @@ function apply(tiles, frame)
             end
         end
     end
-    timing.apply = timing.apply + (dfhack.getTickCount() - started - timing.apply) * TIMING_SMOOTHING
+    timing.apply = timing.apply + (clock_ms() - started - timing.apply) * TIMING_SMOOTHING
 end

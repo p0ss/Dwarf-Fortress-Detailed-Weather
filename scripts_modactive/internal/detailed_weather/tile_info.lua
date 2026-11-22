@@ -18,6 +18,21 @@
 -- Water depth isn't repeated: the game shows it.
 --@ module = true
 
+-- The mod's other scripts, each looked up once and kept. reqscript searches the script folders and
+-- checks the file's date on every call, and these lines are worked out every frame the hover box
+-- shows: asked for each time, as they were, the hover box cost 4 to 8 ms a frame, more than the
+-- rest of the mod together (measured on Windows by grungeisdead). Looked up as first needed, not
+-- as this file loads: detailed_weather.lua loads this file, and is one of them.
+local scripts_found = {}
+local function script_named(name)
+    local found = scripts_found[name]
+    if not found then
+        found = reqscript(name)
+        scripts_found[name] = found
+    end
+    return found
+end
+
 local WATER = 6
 local SNOW_WORDS = {{255, 'deep snow'}, {100, 'snow'}, {1, 'a dusting of snow'}}
 local GRASS_WORDS = {{75, 'lush'}, {50, 'thick'}, {25, 'thin'}, {1, 'sparse'}}
@@ -122,7 +137,7 @@ end
 -- 'air dry (19%)': the map's wetness, one level for the whole map (not the tile's: a tile of
 -- water reads the same), as the ground's look is drawn for it.
 local function wetness_line()
-    local wetness = reqscript('internal/detailed_weather/wetness')
+    local wetness = script_named('internal/detailed_weather/wetness')
     local level = wetness.level()
     return ('air %s (%d%%%s)'):format(words_for(AIR_WORDS, level), math.floor(level * 100 + 0.5),
         wetness.forced and ', forced' or '')
@@ -132,15 +147,15 @@ local function plain(name) return (name:gsub('^fog_', ''):gsub('_', ' ')) end
 
 -- 'snowing lightly; nimbostratus; thick fog; breezy wind from the east', for where the tile is.
 local function weather_line(pos)
-    local main = reqscript('detailed_weather')
-    local wind = reqscript('internal/detailed_weather/wind')
+    local main = script_named('detailed_weather')
+    local wind = script_named('internal/detailed_weather/wind')
     local parts = {}
     local data = df.global.world.world_data
     local map = df.global.world.map
     local clouds = data.region_map[map.region_x // 16]:_displace(map.region_y // 16).clouds
 
     local falling
-    local precipitation = reqscript('internal/detailed_weather/precipitation')
+    local precipitation = script_named('internal/detailed_weather/precipitation')
     if main.force == 'rain' or main.force == 'snow' then
         local kind = main.force
         falling = precipitation.FALLING[kind][precipitation.level(kind, true)] .. ' (forced)'
@@ -225,7 +240,7 @@ local function spatter_line(pos)
         parts[#parts + 1] = ('%s %d'):format(name[2], name[3])
         total = total + name[3]
     end
-    local share = reqscript('internal/detailed_weather/spatter').share_for(total)
+    local share = script_named('internal/detailed_weather/spatter').share_for(total)
     return ('spatter: %s (%d%% of full)'):format(table.concat(parts, ', '), math.floor(share * 100 + 0.5))
 end
 
@@ -239,8 +254,8 @@ function describe(pos)
     local plant = dfhack.maps.getPlantAtTile(pos)
     if plant then lines[#lines + 1] = plant_line(plant, tiletype) end
     local ok, falling = pcall(function()
-        local _, _, strength = reqscript('internal/detailed_weather/wind').get()
-        return reqscript('internal/detailed_weather/leaves').falling_at(pos, strength)
+        local _, _, strength = script_named('internal/detailed_weather/wind').get()
+        return script_named('internal/detailed_weather/leaves').falling_at(pos, strength)
     end)
     if ok and falling then lines[#lines + 1] = falling end
     local ok, spatter = pcall(spatter_line, pos)

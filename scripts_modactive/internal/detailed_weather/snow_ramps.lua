@@ -47,6 +47,8 @@
 -- (lower_viewport[d - 1] for d levels down), laid out like the main one.
 --@ module = true
 
+local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+
 local SNOWY = 100            -- snow amount (0-255) from which a ramp is drawn snowy
 local MOST_DEPTH = 8
 local REMEMBER_MS = 2000     -- how long a tile's plan is kept before it's worked out again
@@ -76,6 +78,7 @@ local OTHER_CELL = 28        -- RAMP_OTHER: no walls
 
 local art_dir = (debug.getinfo(1, 'S').source:match('^@(.*[/\\])') or '') .. '../../../art/'
 local grass = reqscript('internal/detailed_weather/grass')   -- texture pixels, grass edge art
+local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
 _G.detailed_weather_made = _G.detailed_weather_made or {}   -- shared: see frost.lua
 local made = _G.detailed_weather_made
 
@@ -303,7 +306,7 @@ local function thin_version(texpos, x, y, z, amount)
     local block = (y % r) * r + x % r
     local art, index
     if t.inside_cells[cell] and z then
-        local now, levels, edge = dfhack.getTickCount(), t.levels, t.edge_level
+        local now, levels, edge = clock_ms(), t.levels, t.edge_level
         local combo = ((corner_level(x, y, z, edge, now) * levels + corner_level(x + 1, y, z, edge, now)) * levels
             + corner_level(x, y + 1, z, edge, now)) * levels + corner_level(x + 1, y + 1, z, edge, now)
         local variant = math.floor(lattice(x, y, 9) * t.inside_variants) % t.inside_variants
@@ -552,7 +555,7 @@ NOTHING_DRAWN = NOTHING_DRAWN or {ramps = {}, floors = {}, edges = {}}
 warm_view, warm_idle = warm_view or nil, warm_idle or 0   -- the view it's warming round; tiles since it last had work
 
 function plan(viewport)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     if not cell_of_byte then cell_of_byte = cell_table() end
     local main = df.global.gps.main_viewport
     if not piece_sides then find_snow_pieces() end
@@ -567,7 +570,7 @@ function plan(viewport)
 
     local block_at = grass.block_at   -- kept between plans
     -- each tile's snow, from grass.lua's per-block reading
-    local now_ms = dfhack.getTickCount()
+    local now_ms = clock_ms()
     local function snow_at(_, x, y, z) return grass.snow_amount(x, y, z, now_ms) end
 
     -- one tile from scratch: which level it shows, and whether that's a snowy ramp or floor
@@ -713,7 +716,7 @@ function plan(viewport)
         return {depth = MOST_DEPTH}
     end
 
-    local now = dfhack.getTickCount()
+    local now = clock_ms()
     -- Tiles are remembered by map position and level, so moving the view or going up and down a
     -- level reuses what's known.
     if remembered_count > REMEMBER_MOST then remembered, remembered_count = {}, 0 end
@@ -880,9 +883,11 @@ function plan(viewport)
         if #record.ramps == 0 and #record.floors == 0 and #record.edges == 0 then record = NOTHING_DRAWN end
         drawn[key] = record
     end
-    local slice_ms, new_tiles_ms = SLICE_MS * allowance, NEW_TILES_MS * allowance
-    local function out_of_time() return dfhack.getTickCount() - started >= slice_ms end
-    local function out_of_time_for_new() return dfhack.getTickCount() - started >= new_tiles_ms end
+    -- (the strip a pan brought in gets the longer time; both come out of the one share)
+    local new_tiles_ms = work_time.take(NEW_TILES_MS * allowance)
+    local slice_ms = math.min(SLICE_MS * allowance, new_tiles_ms)
+    local function out_of_time() return clock_ms() - started >= slice_ms end
+    local function out_of_time_for_new() return clock_ms() - started >= new_tiles_ms end
 
     -- first: tiles in view with nothing kept (a newly shown strip)
     local complete = true
@@ -925,7 +930,8 @@ function plan(viewport)
             end
         end
     end
-    timing.plan = timing.plan + (dfhack.getTickCount() - started - timing.plan) * 0.2
+    work_time.done()
+    timing.plan = timing.plan + (clock_ms() - started - timing.plan) * 0.2
     -- the planner itself goes with the plan, so apply() can plan a tile it finds with nothing kept
     -- (just shown by a pan, or dropped as stale) and draw it the same frame
     return {z = viewport.z, x1 = viewport.x1, y1 = viewport.y1, complete = complete, plan_tile = plan_and_keep}
@@ -934,7 +940,7 @@ end
 -- Each tile's buffer index is worked out afresh from the view as it is now, and checked against
 -- the buffer's size: a plan from before a zoom or resize can't write outside it.
 function apply(planned, viewport)
-    local started = dfhack.getTickCount()
+    local started = clock_ms()
     if not art then load_art() end
     frame_number = frame_number + 1
     local backgrounds, shadow_flags, floor_flags, spatters, aboves, dims_x, dims_y = {}, {}, {}, {}, {}, {}, {}
@@ -959,13 +965,18 @@ function apply(planned, viewport)
     -- One pass over the view's tiles, drawing each from what's kept for it: its snowy floor, then
     -- its snowy edges, then its snowy ramp (each only touches its own tile).
     local z = viewport.z
+    local inline_plan_ms
     for x = viewport.x1, viewport.x2 do
         for y = viewport.y1, viewport.y2 do
             local key = (z * 4096 + x) * 4096 + y
             local record = drawn[key]
-            if not record and plan_tile and dfhack.getTickCount() - started < INLINE_PLAN_MS * allowance then
-                plan_tile(x, y)
-                record = drawn[key]
+            if not record and plan_tile then
+                -- (its share of the frame's work time, taken at the first tile that needs it)
+                inline_plan_ms = inline_plan_ms or work_time.take(INLINE_PLAN_MS * allowance)
+                if clock_ms() - started < inline_plan_ms then
+                    plan_tile(x, y)
+                    record = drawn[key]
+                end
             end
             if record and record ~= NOTHING_DRAWN then
                 -- The record was made from the screen as it was then. If the screen now disagrees
@@ -1031,7 +1042,7 @@ function apply(planned, viewport)
             end
         end
     end
-    timing.apply = timing.apply + (dfhack.getTickCount() - started - timing.apply) * 0.05
+    timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
 end
 
 -- Another map or world loading: what's kept by position belongs to the old map, and what's kept by
