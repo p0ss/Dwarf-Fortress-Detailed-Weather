@@ -1,0 +1,16 @@
+# No art in this repository: the pictures ship with the mod on the Steam Workshop (see README.md).
+*.png
+*.gif
+*.jpg
+*.jpeg
+*.bmp
+*.webp
+*.tga
+*.xcf
+*.psd
+*.kra
+*.ase
+*.aseprite
+
+# copies the `detailed_weather reload` command makes while testing
+/art/reloaded/
