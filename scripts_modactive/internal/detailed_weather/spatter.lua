@@ -46,6 +46,11 @@ local TILE = 32
 mode = mode or 'on'
 blades_mode = blades_mode or 'on'   -- the grass's blades drawn in front of the spatter
 allowance = allowance or 1          -- the share of its usual baking time a frame (settings.lua: less at low)
+-- NATIVE SPATTER (grungeisdead's copy, test 15Y): true while the hook DLL puts the spatter in the grass
+-- (native.lua: THE SPATTER DRAWN BY THE DLL; detailed_weather_dll.cpp: THE SPATTER DRAWN HERE), with this
+-- file's rules and painting; apply does nothing meanwhile. mode and blades_mode still decide, read by
+-- native.lua each frame.
+native_spatter = native_spatter or false
 -- What's been made, each entry {handle =, texpos =}, or {} where there was nothing to make:
 baked_pieces = baked_pieces or {}   -- piece_key(spatter texture, share, pattern) -> the thinned spatter
 baked_blades = baked_blades or {}   -- grass texture showing -> its blades (also .original, .lean)
@@ -216,7 +221,7 @@ end
 local function retire(entry)
     if not entry.handle then return end
     made[entry.texpos] = nil
-    grass.discard(entry.handle, 'spatter in the grass')
+    grass.discard(entry.handle)
     baked_count = baked_count - 1
 end
 
@@ -305,7 +310,7 @@ local function thinned_piece(spatter_texpos, share, variant, colour_copy)
 end
 
 -- Notes the blades now showing for a grass original. The ones they replace are let go if they
--- were only being kept for this.
+-- were only being kept for this (see forget_other_leans).
 local function remember_blades(ground_original, entry)
     local previous = last_blades[ground_original]
     if previous == entry then return end
@@ -339,22 +344,54 @@ local function blades_over(ground, ground_original, lean)
     return last_blades[ground_original]
 end
 
+-- When the wind turns, colour.lua makes a new set of leaning frames and frees the old set, whose
+-- texture numbers may then be given to other pictures. The blades made from the old set go with
+-- it, apart from the one last shown for each grass, which stands in until the new set's are made.
+local lean_seen
+local function forget_other_leans(lean)
+    if lean == lean_seen then return end
+    lean_seen = lean
+    for ground, entry in pairs(baked_blades) do
+        if entry.lean and entry.lean ~= lean then
+            baked_blades[ground] = nil
+            if last_blades[entry.original] == entry then entry.orphan = true else retire(entry) end
+        end
+    end
+end
+
 local seen_generation   -- colour.copies_generation the bakes were made with
+
+-- SPATTER FOUND IN ONE CALL (grungeisdead's copy, 2026-11-17). A screen buffer's address (the pointer in
+-- its field, as colour.lua's buffer_base reads it), or nil if it can't be read; and a buffer of zeros at
+-- least n cells long, made once and again only when the screen grows, for DFHack's diffscan
+-- (library/LuaApi.cpp: the first index from start to end where two buffers differ).
+local function buffer_base(port, name)
+    local ok, slot = pcall(function() local _, at = df.sizeof(port:_field(name)) return at end)
+    if ok and slot then return df.reinterpret_cast('uint64_t', slot).value end
+end
+spatter_zeros = spatter_zeros or {buf = nil, size = 0}
+local function zeros_for(n)
+    if spatter_zeros.size < n then
+        if spatter_zeros.buf then df.delete(spatter_zeros.buf) end
+        local buf = df.new('int32_t', n)
+        for k = 0, n - 1 do buf[k] = 0 end
+        spatter_zeros.buf, spatter_zeros.size = buf, n
+    end
+    return spatter_zeros.buf
+end
 
 -- Every frame, after the colour's swaps: each piece of spatter on grass in view, in the grass.
 function apply(viewport)
-    if mode ~= 'on' then return end
+    if mode ~= 'on' or native_spatter then return end
     local started = clock_ms()
     bake_started = nil
     if seen_generation ~= colour.copies_generation then
         if seen_generation then clear_cache() end
         seen_generation = colour.copies_generation
     end
-    -- (only for its size when textures are being deleted: grass.lua)
     if grass.delete_textures and baked_count >= BAKED_MOST then clear_cache() end
-    -- (the leaning frames of a wind direction are kept by colour.lua once made, so the blades made
-    -- from them hold too)
     local lean = colour.state and colour.state.lean or nil
+    forget_other_leans(lean)
 
     local port = df.global.gps.main_viewport
     local spatter, background, items = port.screentexpos_spatter, port.screentexpos_background, port.screentexpos_item
@@ -366,11 +403,29 @@ function apply(viewport)
     local ours = colour.state and colour.state.ours or {}
     local colour_copy = colour.state and colour.state.screen_original or {}
     local original_of, class_of = colour.original_of, colour.class_of
+    -- SPATTER FOUND IN ONE CALL: each column's cells with anything in the spatter layer are found by
+    -- diffscan against zeros, in DFHack's own code, and only those are read. Every cell in view was
+    -- read through DFHack's bridge every frame, some 8000 zoomed out, to find the few with spatter or
+    -- none at all (detailed_weather details: spatter 0.5 ms a frame with nothing on the grass). If the
+    -- buffer's address can't be read (or this DFHack has no diffscan), every cell is gone over as before.
+    local diffscan = dfhack.internal.diffscan
+    local base = diffscan and buffer_base(port, 'screentexpos_spatter')
+    local zeros = base and zeros_for(port.dim_x * dim_y)
     for sx = 0, cols - 1 do
         local column = sx * dim_y
-        for sy = 0, rows - 1 do
-            local i = column + sy
+        local i, stop = column, column + rows
+        while i < stop do
             local t = spatter[i]
+            -- an empty cell: the empty run from it passed over in one call (none left with anything:
+            -- on to the next column). Cells with something are read one by one (grungeisdead's copy,
+            -- 2026-11-17): under snow nearly every cell has a piece, and a call a cell cost more than
+            -- the read it saved (detailed_weather details: spatter 2.6 ms a frame in a snowy view).
+            if t == 0 and zeros then
+                i = diffscan(zeros, base, i + 1, stop, 4)
+                if not i then break end
+                t = spatter[i]
+            end
+            local sy = i - column
             if t > 0 and not made[t] and (not ours[t] or colour_copy[t]) then
                 local ground = background[i]
                 local ground_original = ground > 0 and original_of(ground)
@@ -388,6 +443,7 @@ function apply(viewport)
                     end
                 end
             end
+            i = i + 1
         end
     end
     timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
@@ -399,5 +455,6 @@ function forget_world()
 end
 
 function describe()
+    if native_spatter then return mode .. ': drawn by the hook DLL (detailed_weather native)' end
     return ('%s: %.2f ms a frame, %d pieces and blade layers made'):format(mode, timing.apply, baked_count)
 end

@@ -117,6 +117,13 @@ Examples
 --                                    light snow to 4 a rainstorm or blizzard), and stays forced
 --                                    for the game's own rain or snow until `auto`
 --   detailed_weather ramps on|off     snow on snowy ramps (default on)
+--   detailed_weather native [stop|start|fog|rain]  the drawing done by the hook DLL
+--                                    (dfhooks_detailed_weather.dll): what it has counted; stop hands
+--                                    it all back to the Lua; fog and rain turn its fog over water and
+--                                    its falling rain and snow off and on
+--   detailed_weather install          copy the hook DLL from this mod's folder into DF's now (done by
+--                                    itself at a fort's load); it's used from DF's next start
+--   detailed_weather uninstall        take it out of DF's folder (from DF's next start)
 --   detailed_weather frost on|off     ramps redrawn for the look (default on)
 --   detailed_weather frost old on|off  (testing) the old floor effects by each tile's temperature
 --   detailed_weather colour on|off|auto|N
@@ -148,13 +155,11 @@ Examples
 --   detailed_weather marker LAYER|off  (testing) paint a translucent magenta square into that screen
 --                                    layer (e.g. vehicle) in the middle of the view, to see what
 --                                    draws above and below it
---   detailed_weather textures keep|free
---                                    (testing) keep: never delete a texture (default; see
---                                    grass.lua for why); free: delete them when finished with
 --   detailed_weather reload           reload the art, e.g. after rebuilding it
 --@ module = true
 
 local clock_ms = reqscript('internal/detailed_weather/clock').ms   -- the time in whole ms (clock.lua)
+local clock_s = reqscript('internal/detailed_weather/clock').s     -- and in seconds, for timing short work
 
 local overlay = require('plugins.overlay')
 local guidm = require('gui.dwarfmode')
@@ -201,6 +206,14 @@ local spatter = reqscript('internal/detailed_weather/spatter')
 local murky = reqscript('internal/detailed_weather/murky')
 local leaves = reqscript('internal/detailed_weather/leaves')
 local work_time = reqscript('internal/detailed_weather/work_time')   -- the frame's shared time for background work
+-- NATIVE SNOW (grungeisdead's copy, 2026-11-18): all of the snow drawn by the hook DLL while it's in DF's
+-- folder (native.lua); snow_ramps.lua then only bakes the textures it asks for
+local native = reqscript('internal/detailed_weather/native')
+-- THE HOOK DLL'S INSTALLER (grungeisdead's copy, 2026-11-20, test 16A): install.lua copies the hook DLL from
+-- this mod's folder into DF's at a fort's load, as Stockhook does, and asks for a restart once. Looked up
+-- with pcall, so a copy without the file runs as before.
+local install_ok, install = pcall(reqscript, 'internal/detailed_weather/install')
+if not install_ok then install = nil end
 
 ----------------------------------------------------------------------------------------------
 -- Art
@@ -339,7 +352,8 @@ end
 local function weather_at(x, y, z)
     if force == 'rain' or force == 'snow' then return force end
     if force == 'off' or falling_mode == 'off' then return nil end
-    local weather = dfhack.maps.getCurrentWeather(x, y, z)
+    -- (GROUND WEATHER, grass.lua: the weather where rain lands below this tile, not open air's own biome)
+    local weather = grass.ground_weather(x, y, z)
     return weather == df.weather_type.Rain and 'rain' or weather == df.weather_type.Snow and 'snow' or nil
 end
 
@@ -369,8 +383,29 @@ local function weather_key(viewport)
     return table.concat(parts, ',')
 end
 
-local function is_water(flags)
-    return flags and flags.flow_size > 0 and not flags.liquid_type
+-- RAIN READ IN ONE COPY (grungeisdead's copy, 2026-11-19). A raining block's 16x16 designation flags
+-- (1 KB, column by column as designation[dx][dy], so tile dx * 16 + dy) and tiletypes (512 bytes) are
+-- copied out with one memmove each and the bits tested in Lua, as colour.lua's underground check and
+-- shade.lua do. Each tile's flags were read through DFHack field by field: 14.4 ms a rescan, four
+-- rescans a second, once rain was found in view (details, 2026-11-19).
+-- The bits, set on a scratch word through DFHack's own layout (the fallbacks are df-structures').
+local function designation_mask(name, value, fallback)
+    local ok, mask = pcall(function()
+        local raw = df.new('uint32_t')
+        raw.value = 0
+        local _, at = df.sizeof(raw)
+        df.reinterpret_cast(df.tile_designation, at)[name] = value
+        local m = raw.value
+        df.delete(raw)
+        return m
+    end)
+    return (ok and mask and mask ~= 0) and mask or fallback
+end
+local rain_bits = nil   -- {outside, hidden, flow, magma}: made once
+local rain_des, rain_below, rain_types = nil, nil, nil   -- the block being read, its level below, its tiletypes
+local function copy_field(block, name, buf, bytes)
+    local _, at = df.sizeof(block:_field(name))
+    dfhack.internal.memmove(buf, at, bytes)
 end
 
 -- Where rain or snow can land in one map block (16 x 16 tiles): its outdoor, revealed tiles, each
@@ -394,21 +429,39 @@ local function map_name()
 end
 
 local function read_fall_block(block_x, block_y, z, now)
+    if not rain_bits then
+        rain_bits = {outside = designation_mask('outside', true, 1 << 16), hidden = designation_mask('hidden', true, 1 << 9),
+                     flow = designation_mask('flow_size', 7, 7), magma = designation_mask('liquid_type', true, 1 << 21)}
+        rain_des, rain_below = df.new('uint32_t', 256), df.new('uint32_t', 256)
+        rain_types = df.new('uint16_t', 256)
+    end
+    local OUTSIDE, HIDDEN, FLOW, MAGMA = rain_bits.outside, rain_bits.hidden, rain_bits.flow, rain_bits.magma
+    local EMPTY = df.tiletype_shape.EMPTY
+    local des, below_des, types = rain_des, rain_below, rain_types
     local tiles = {}
     local block = dfhack.maps.getTileBlock(block_x, block_y, z)
     if block then
+        -- (each field copied out once and read as plain numbers: a read through DFHack of every
+        -- tile's flags one by one was most of a scan's time)
+        copy_field(block, 'designation', des, 1024)
+        copy_field(block, 'tiletype', types, 512)
         local below = dfhack.maps.getTileBlock(block_x, block_y, z - 1)
-        local EMPTY = df.tiletype_shape.EMPTY
+        if below then copy_field(below, 'designation', below_des, 1024) end
         for dx = 0, 15 do
-            local designations, tiletypes = block.designation[dx], block.tiletype[dx]
-            local designations_below = below and below.designation[dx]
             for dy = 0, 15 do
-                local flags = designations[dy]
-                if flags.outside and not flags.hidden then
-                    -- on water, or falling through open air onto water just below
-                    local onto_water = is_water(flags) or (designations_below
-                        and shape_of(tiletypes[dy]) == EMPTY and is_water(designations_below[dy]))
-                    tiles[#tiles + 1] = {x = block_x + dx, y = block_y + dy, surface = onto_water and WATER or GROUND}
+                local i = dx * 16 + dy
+                local d = des[i]
+                if d & OUTSIDE ~= 0 and d & HIDDEN == 0 then
+                    -- on water (flowing liquid that isn't magma), or falling through open air onto
+                    -- water just below
+                    local surface = GROUND
+                    if d & FLOW ~= 0 and d & MAGMA == 0 then
+                        surface = WATER
+                    elseif below and shape_of(types[i]) == EMPTY then
+                        local b = below_des[i]
+                        if b & FLOW ~= 0 and b & MAGMA == 0 then surface = WATER end
+                    end
+                    tiles[#tiles + 1] = {x = block_x + dx, y = block_y + dy, surface = surface}
                 end
             end
         end
@@ -498,7 +551,9 @@ local function find_outdoors(viewport)
     local z = viewport.z
     local block_at = grass.block_at   -- kept between scans
     local EMPTY, RAMP_TOP = df.tiletype_shape.EMPTY, df.tiletype_shape.RAMP_TOP
-    local see_through = {}   -- tiletype -> whether it's open space; attrs are slow to look up
+    local WALL, BROOK_BED = df.tiletype_shape.WALL, df.tiletype_shape.BROOK_BED
+    local FROZEN = df.tiletype_material.FROZEN_LIQUID
+    local see_through, no_fog = {}, {}   -- by tiletype; attrs are slow to look up
     for x = viewport.x1, viewport.x2 do
         for y = viewport.y1, viewport.y2 do
           local key = (z * 4096 + x) * 4096 + y
@@ -511,12 +566,23 @@ local function find_outdoors(viewport)
             local block = block_at(x, y, z)
             local flags = block and block.designation[x % 16][y % 16]
             -- above ground rather than 'outside': tiles under a tree's canopy count as indoors, and
-            -- went without fog, standing out bright among the fogged ones. Not under water: a lake
-            -- is 'outside' all the way down, and showed fog on its levels below the surface (Poss)
-            -- (or, frozen over, under ice): water with anything but open air above it
-            local above = flags and flags.flow_size > 0 and block_at(x, y, z + 1)
-            local submerged = above and (above.designation[x % 16][y % 16].flow_size > 0
-                or not (shape_of(above.tiletype[x % 16][y % 16]) == EMPTY or shape_of(above.tiletype[x % 16][y % 16]) == RAMP_TOP))
+            -- went without fog, standing out bright among the fogged ones. Not inside water or
+            -- frozen water (ice walls, brook beds): surface fog draws on the level above instead.
+            local submerged = false
+            if block then
+                if flags.flow_size > 0 then
+                    submerged = true
+                else
+                    local tt = block.tiletype[x % 16][y % 16]
+                    local nf = no_fog[tt]
+                    if nf == nil then
+                        local attrs = df.tiletype.attrs[tt]
+                        nf = (attrs.material == FROZEN and attrs.shape == WALL) or attrs.shape == BROOK_BED
+                        no_fog[tt] = nf
+                    end
+                    submerged = nf
+                end
+            end
             if not submerged and ((not block and dfhack.maps.isValidTilePos(x, y, z))
                     or (flags and (flags.outside or not flags.subterranean) and not flags.hidden)) then
                 local depth, level = 0, z
@@ -563,6 +629,37 @@ local function texpos_of(handle)
     return texpos
 end
 
+-- A WHOLE SHEET FOR THE HOOK LIBRARY. The library's tables are by a sheet's tile numbers as drawn,
+-- every group at once; the art is packed a file per group (sheet_of). Until the library knows the
+-- groups itself, a sheet it's handed gets `tiles`: for every tile number its texture's handle, or
+-- false for a tile with nothing drawn. Every group's file is loaded for it, in the one frame.
+local function whole_sheet(name)
+    local sheet = sheet_of(name)
+    if not sheet.tiles then
+        local layout = sheet.layout
+        local side = layout.cells or layout.patch
+        local tiles_a_group = side * side * layout.frames
+        local group_count = art.indexes[family_of(name)].groups
+        local tiles = {}
+        for number, place in ipairs(sheet.at) do
+            local handle = false
+            if place > 0 then
+                local group = (number - 1) // tiles_a_group % group_count + 1
+                local handles = sheet.groups[group]
+                if not handles then
+                    handles = dfhack.textures.loadTileset(art_path(('falling/%s-%d.png'):format(name, group)), 32, 32, true)
+                    sheet.groups[group] = handles
+                end
+                handle = handles[place] or false
+            end
+            tiles[number] = handle
+        end
+        sheet.tiles = tiles
+    end
+    return sheet
+end
+local function whole_texpos_of(handle) return handle and texpos_of(handle) or 0 end
+
 ----------------------------------------------------------------------------------------------
 -- Changing map
 ----------------------------------------------------------------------------------------------
@@ -580,6 +677,7 @@ dfhack.onStateChange.detailed_weather = function(event)
     forget_fall_blocks()
     grass.forget_world()
     snow_ramps.forget_world()
+    native.forget_world()
     frost.forget_world()
     wind.forget_world()
     shade.forget_world()
@@ -685,12 +783,16 @@ function RainOverlay:init()
 end
 
 function RainOverlay:onRenderFrame(dc)
+    if dfhack.isMapLoaded() then native.sync_view() end
     if not map_drawn then return end
     map_drawn = false
     if not dfhack.screen.inGraphicsMode() or not dfhack.isMapLoaded() then return end
     local frame_started = clock_ms()
+    local precise = clock_s()
     self.parts = {}
     self:draw_weather(dc)
+    profile.precise_ms = (profile.precise_ms or 0) + (clock_s() - precise) * 1000
+    _G.detailed_weather_frame_ms = (clock_s() - precise) * 1000   -- (colour.lua: CHANGES OF LOOK TIMED)
     local took = clock_ms() - frame_started
     profile.frames = profile.frames + 1
     profile.average = profile.average + (took - profile.average) * 0.05
@@ -723,13 +825,20 @@ local function rest_after_failure(name, now)
     stage_rests[name] = rest
 end
 
+-- STAGE TIMING (grungeisdead's copy, 2026-11-16): each stage's time, added up in fractional ms
+-- (clock.lua's seconds, not the whole-ms clock the notes use) since `detailed_weather details` last
+-- showed them, and the whole frame's (profile.precise_ms), so details can give each stage's average a
+-- frame and what ran outside every stage. The tile info overlay's own frames are added here too.
+stage_ms = stage_ms or {}
 function RainOverlay:timed(name, fn, ...)
     local started = clock_ms()
     local rest = stage_rests[name]
     if rest and started < rest.retry_at then return end
     work_time.start_stage()
+    local precise = clock_s()
     local ok, problem = pcall(fn, ...)
     work_time.done()   -- whatever work the stage left under way ends with it
+    stage_ms[name] = (stage_ms[name] or 0) + (clock_s() - precise) * 1000
     if ok then
         stage_rests[name] = nil
     else
@@ -740,6 +849,28 @@ function RainOverlay:timed(name, fn, ...)
     end
     local took = clock_ms() - started
     if took >= 1 then self:note(name .. '=' .. took) end
+end
+
+-- The fog's density (the sheet's level) and each depth's drift this frame, in steps (by depth: lower
+-- levels drift slower, and show other shapes). The fog moves on real time, at a steady speed set by
+-- the wind, and stands still while the game is paused. Its position builds up frame by frame, so a
+-- change of wind changes its pace without a jump. (grungeisdead's copy, test 15X: taken out of the
+-- drawing, unchanged, for the DLL's drawing too.)
+function RainOverlay:fog_drift(now)
+    local fog_layout = art.fog_layout
+    local elapsed = self.fog_clock and math.min(now - self.fog_clock, 200) or 0
+    self.fog_clock = now
+    if df.global.pause_state then elapsed = 0 end
+    -- the art only drifts east or west, so only that part of the wind moves it
+    local across = wind.get()
+    local px_per_ms = (FOG_CALM_PX + FOG_WIND_PX * math.abs(across)) / 1000 * (across < 0 and -1 or 1)
+    self.fog_px = (self.fog_px or 0) + px_per_ms * elapsed
+    local steps_at = {}
+    for depth = 0, FOG_MOST_DEPTH do
+        steps_at[depth] = math.floor(self.fog_px / (1 + FOG_DEPTH_SLOWING * depth) / fog_layout.step) + depth * 37
+    end
+    local level = math.max(1, math.floor(self.fog * (fog_layout.substeps or 1) + 0.5))   -- the sheet's density
+    return level, steps_at
 end
 
 function RainOverlay:draw_weather(dc)
@@ -778,7 +909,8 @@ function RainOverlay:draw_weather(dc)
         self.rain_level = precipitation.level('rain', force == 'rain')
         self.snow_level = precipitation.level('snow', force == 'snow')
         local key = weather_key(viewport)
-        if key ~= self.weather_key then self.weather_key, self.due.rain = key, true end
+        -- (NATIVE RAIN: a change asks the DLL's grid for every block again, not only those not kept)
+        if key ~= self.weather_key then self.weather_key, self.due.rain, self.rain_full = key, true, true end
         local fog = fog_level()
         if fog ~= self.fog then self.fog, self.due.fog = fog, true end
         if now >= (self.next_ramp_scan or 0) then self.due.ramps = true end
@@ -787,10 +919,28 @@ function RainOverlay:draw_weather(dc)
     if now >= (self.next_fog_scan or 0) and self.fog and self.fog > 0 then self.due.fog = true end
     local started = clock_ms()
     local scan_started = started
+    -- NATIVE RAIN (grungeisdead's copy, test 15M): while the hook DLL draws the falling rain and snow
+    -- (native.lua: RAIN AND SNOW FALLING), a rescan only hands it the weather by map block; the tiles
+    -- are neither found nor drawn here. A switch either way rescans at once, so neither side draws
+    -- the other's tiles for a frame.
+    local native_rain = native.rain_running()
+    if native_rain ~= self.native_rain then
+        self.native_rain, self.due.rain, self.rain_full, self.tiles = native_rain, true, true, {}
+    end
+    -- THE FOG DRAWN BY THE DLL (test 15X): while it draws the fog, the outdoor tiles aren't looked for
+    -- here; a switch either way looks again (or lets them go) at once
+    local native_fog = native.wfog_running()
+    if native_fog ~= self.native_fog then self.native_fog, self.due.fog, self.fog_tiles = native_fog, true, {} end
     local scanned_rain = self.due.rain
     if self.due.rain then
         self:note('rain-scan')
-        self.tiles, self.due.rain = find_rain(viewport), nil
+        if native_rain then
+            native.rain_weather(viewport, weather_at, self.rain_full)
+            self.tiles, self.rain_full = {}, nil
+        else
+            self.tiles = find_rain(viewport)
+        end
+        self.due.rain = nil
         scan_ms.rain = scan_ms.rain + (clock_ms() - started - scan_ms.rain) * 0.2
     end
     -- a moved view's fog can't wait its turn behind the rain: while panning the rain was due every
@@ -799,12 +949,14 @@ function RainOverlay:draw_weather(dc)
     if self.due.fog and (view_moved or not scanned_rain) then
         self:note('fog-scan')
         local fog_started = clock_ms()   -- not `started`: the rain's scan may have run since
-        self.fog_tiles = (self.fog or 0) > 0 and find_outdoors(viewport) or {}
+        self.fog_tiles = (self.fog or 0) > 0 and not native_fog and find_outdoors(viewport) or {}
         self.due.fog, self.next_fog_scan = nil, now + FOG_RESCAN_MS
         scan_ms.fog = scan_ms.fog + (clock_ms() - fog_started - scan_ms.fog) * 0.2
     end
     -- Snow and frost keep what they've worked out per map tile, and plan a little every frame
     -- within their own time budgets (new strips first, then rechecks, then round the view).
+    -- (NATIVE SNOW) the hook DLL's snow started, or handed back, before snow_ramps.lua plans
+    self:timed('native', native.update, ramps_mode == 'on')
     if ramps_mode == 'on' then self:timed('snow-plan', function() self.ramp_tiles = snow_ramps.plan(viewport) end) end
     if frost_mode == 'on' then self:timed('frost-plan', function() self.frost_tiles = frost.plan(viewport) end) end
     if clock_ms() - scan_started >= 1 then self:note('scan=' .. (clock_ms() - scan_started)) end
@@ -824,8 +976,16 @@ function RainOverlay:draw_weather(dc)
     if leaves.mode ~= 'off' or leaves.petals_mode ~= 'off' then
         if not art then art = load_art() end
         local _, _, strength = wind.get()
-        self:timed('leaves', leaves.apply, viewport, sheet_of, sheet_tiles, texpos_of, frame,
-            function(layout) return slant_for_wind(layout.winds) end, strength)
+        local wind_index_for = function(layout) return slant_for_wind(layout.winds) end
+        if native.leaves_running() then
+            -- (THE LEAVES DRAWN BY THE DLL, test 15X: what each tree sheds now, and the sheets, handed over)
+            self:timed('leaves', function()
+                native.leaves_frame({specs = leaves.native_frame(strength), frame = frame, wind_index_for = wind_index_for,
+                                     sheet_of = whole_sheet, texpos_of = whole_texpos_of})
+            end)
+        else
+            self:timed('leaves', leaves.apply, viewport, sheet_of, sheet_tiles, texpos_of, frame, wind_index_for, strength)
+        end
     end
     if marker_layer then
         -- a magenta square, half see-through, with a solid rim, made once
@@ -852,6 +1012,38 @@ function RainOverlay:draw_weather(dc)
             self.next_ground_scan = now + GROUND_RESCAN_MS
         end
         ground.apply(self.ground_tiles, frame)
+    end
+
+    -- NATIVE RAIN (test 15M): the DLL is handed each frame's slant and animation frame, and the
+    -- sheets for how hard each kind falls, loaded (sheet_of) only for a kind falling in view
+    if native_rain then
+        self:timed('rain', function()
+            if not art then art = load_art() end
+            local has_rain, has_snow = native.rain_kinds()
+            local layout, snow_layout = art.rain_layout, art.snow_layout
+            local rain_level = self.rain_level or precipitation.LIGHTEST
+            local snow_level = self.snow_level or precipitation.LIGHTEST
+            native.rain_frame({
+                rain_layout = layout, rain_level = rain_level, rain_name = 'rain_' .. rain_level,
+                rain_sheet = has_rain and whole_sheet('rain_' .. rain_level) or nil,
+                slant = slant_for_wind(layout.slants), rain_frame = frame % layout.frames,
+                snow_layout = snow_layout, snow_level = snow_level, snow_name = 'snow_' .. snow_level,
+                snow_sheet = has_snow and whole_sheet('snow_' .. snow_level) or nil,
+                snow_wind = slant_for_wind(snow_layout.winds), snow_frame = frame % snow_layout.frames,
+                texpos_of = whole_texpos_of,
+            })
+        end)
+    end
+
+    -- THE FOG DRAWN BY THE DLL (test 15X): this frame's density and drift handed over (0: none)
+    if native_fog then
+        self:timed('fog', function()
+            if not art then art = load_art() end
+            local level, steps = 0, nil
+            if (self.fog or 0) > 0 then level, steps = self:fog_drift(now) end
+            native.wfog_frame({level = level, steps = steps, layout = art.fog_layout,
+                               handles = level > 0 and whole_sheet('fog').tiles or nil, texpos_of = whole_texpos_of})
+        end)
     end
 
     if #self.tiles == 0 and #self.fog_tiles == 0 then return end
@@ -917,22 +1109,8 @@ function RainOverlay:draw_weather(dc)
     if #self.fog_tiles > 0 and (self.fog or 0) > 0 then
         local started = clock_ms()
         local fog_layout = art.fog_layout
-        -- The fog moves on real time, at a steady speed set by the wind, and stands still while
-        -- the game is paused. Its position builds up frame by frame, so a change of wind changes
-        -- its pace without a jump.
-        local elapsed = self.fog_clock and math.min(now - self.fog_clock, 200) or 0
-        self.fog_clock = now
-        if df.global.pause_state then elapsed = 0 end
-        -- the art only drifts east or west, so only that part of the wind moves it
-        local across = wind.get()
-        local px_per_ms = (FOG_CALM_PX + FOG_WIND_PX * math.abs(across)) / 1000 * (across < 0 and -1 or 1)
-        self.fog_px = (self.fog_px or 0) + px_per_ms * elapsed
-        local steps_at = {}   -- by depth: lower levels drift slower, and show other shapes (offset)
-        for depth = 0, FOG_MOST_DEPTH do
-            steps_at[depth] = math.floor(self.fog_px / (1 + FOG_DEPTH_SLOWING * depth) / fog_layout.step) + depth * 37
-        end
+        local level, steps_at = self:fog_drift(now)
         local paint, pen = dfhack.screen.paintTile, FOG_PEN
-        local level = math.max(1, math.floor(self.fog * (fog_layout.substeps or 1) + 0.5))   -- the sheet's density
         -- that density's textures; while its file loads (the fog thickening a step), the density
         -- drawn last carries on
         local fog_sheet = sheet_of('fog')
@@ -973,6 +1151,11 @@ local tile_info = reqscript('internal/detailed_weather/tile_info')
 local HOVER_TOP = 3            -- first screen row below the top bar
 local HOVER_SEARCH_ROWS = 14   -- how far down to look for the box
 local HOVER_FIND_MS = 250
+-- How often the lines are worked out again while the mouse stays on one tile (grungeisdead's
+-- copy, 2026-11-16): they were worked out afresh every frame, which with the module lookups in
+-- tile_info.lua cost 4 to 7.7 ms a frame. They're still drawn every frame (the game redraws the
+-- screen each frame); a new tile under the mouse works them out at once.
+local INFO_REFRESH_MS = 250
 local TILE_INFO_PEN = dfhack.pen.parse{fg = COLOR_WHITE, bg = COLOR_BLACK}
 
 local function row_text_start(y, width)
@@ -1018,8 +1201,8 @@ end
 
 -- The hover box's line naming fallen fruit or seeds ("Sand pears"), shown as spatter ("Sand pear
 -- spatter"): what lies there can't be gathered, though the game gives it the fruit's own name.
-function rename_spatter(dc, pos, left, last)
-    local names = tile_info.spatter_names(pos)
+-- names: tile_info.spatter_names for the hovered tile, worked out with its lines (onRenderFrame).
+function rename_spatter(dc, names, left, last)
     if #names == 0 then return end
     for y = HOVER_TOP, last do
         local text, pens = row_text(left, y, dc.width)
@@ -1074,12 +1257,27 @@ function TileInfoOverlay:onRenderFrame(dc)
         self.next_find = now + HOVER_FIND_MS
     end
     if not self.box_left then return end   -- no hover box showing: nothing to add to
-    rename_spatter(dc, pos, self.box_left, self.box_last)
-    local lines = tile_info.describe(pos)
+    -- the lines and the spatter's names, worked out for a new tile or every INFO_REFRESH_MS
+    local key = (pos.z * 4096 + pos.x) * 4096 + pos.y
+    if key ~= self.info_key or now >= (self.info_due or 0) then
+        self.info_key, self.info_due = key, now + INFO_REFRESH_MS
+        self.info_lines, self.info_spatter = tile_info.describe(pos), tile_info.spatter_names(pos)
+    end
+    rename_spatter(dc, self.info_spatter, self.box_left, self.box_last)
+    local lines = self.info_lines
     for n, line in ipairs(lines) do
         local text = ' ' .. line .. ' '
         dc:seek(self.box_left - 1, self.box_last + 1 + n):string(text:sub(1, dc.width - self.box_left), TILE_INFO_PEN)
     end
+end
+
+-- STAGE TIMING: the tile info overlay's frames, timed as a stage of their own. (A command running
+-- this file again defines onRenderFrame afresh above, so it is only ever wrapped once.)
+local draw_tile_info = TileInfoOverlay.onRenderFrame
+function TileInfoOverlay:onRenderFrame(dc)
+    local precise = clock_s()
+    draw_tile_info(self, dc)
+    stage_ms['tile-info'] = (stage_ms['tile-info'] or 0) + (clock_s() - precise) * 1000
 end
 
 OVERLAY_WIDGETS = {map_drawn = MapDrawnOverlay, rain = RainOverlay, tile_info = TileInfoOverlay}
@@ -1148,6 +1346,33 @@ elseif command == 'colour' then
 elseif command == 'frost' and how == 'old' then   -- (testing) the old floor effects
     frost.floor_effects = ({...})[3] ~= 'off'
     frost.forget()
+elseif command == 'frost' and how == 'flips' then   -- (diagnostic, grungeisdead's copy) frost.lua: FLIPS KEPT TO LOOK AT
+    frost.dump_flips()
+elseif command == 'snowshot' then   -- (diagnostic, grungeisdead's copy, 2026-11-17) snow_ramps.lua: SNOWSHOT
+    snow_ramps.arm_shot()
+elseif command == 'native' then   -- (grungeisdead's copy, 2026-11-18) native.lua: the hook DLL's snow
+    native.command(how)
+    return
+elseif command == 'install' or command == 'uninstall' then   -- (grungeisdead's copy, 2026-11-20, test 16A) install.lua
+    if not install then
+        print('detailed_weather: internal/detailed_weather/install.lua is missing from this copy')
+        return
+    end
+    if command == 'uninstall' then
+        local ok, why = install.uninstall()
+        print(ok and 'detailed_weather: the hook DLL is out of DF\'s folder; DF loads it no more from its next start'
+            or ('detailed_weather: not uninstalled: %s'):format(tostring(why)))
+        return
+    end
+    local what, why = install.check(false)
+    local said = {
+        current = 'the hook DLL in DF\'s folder is already this copy\'s',
+        installed = 'the hook DLL is installed in DF\'s folder; close DF completely and start it again to use it',
+        updated = 'the hook DLL in DF\'s folder is updated; close DF completely and start it again to use it',
+        newer = 'DF\'s folder holds a newer hook DLL than this copy\'s; left alone',
+    }
+    print('detailed_weather: ' .. (said[what] or ('not installed: %s (%s)'):format(tostring(why), install.log_path())))
+    return
 elseif command == 'leaves' then
     leaves.mode = ({...})[2] or 'auto'
 elseif command == 'petals' then
@@ -1193,7 +1418,7 @@ local function show_summary()
     local function falling_name(kind)
         return precipitation.NAMES[kind][precipitation.level(kind, module.force == kind)]
     end
-    local game_weather = dfhack.maps.getCurrentWeather(x, y, view.z)
+    local game_weather = grass.ground_weather(x, y, view.z)   -- (GROUND WEATHER)
     local here = game_weather == df.weather_type.Rain and falling_name('rain')
         or game_weather == df.weather_type.Snow and falling_name('snow') or 'clear'
     local shown = here   -- following the game
@@ -1235,6 +1460,8 @@ local function show_summary()
         line('', table.concat(reduced, ', '))
     end
     line('Time', ('%.1f ms a frame'):format(module.profile.average))
+    -- textures let go and kept, not deleted (grass.lua)
+    line('Let go', ('%d textures kept, about %d MB'):format(grass.kept_count, grass.kept_count * 4 // 1024))
     for report, count in pairs(module.stage_errors) do
         print(('  A part failed %d time%s: %s'):format(count, count == 1 and '' or 's', report))
     end
@@ -1258,20 +1485,36 @@ local function show_details()
     if dfhack.isMapLoaded() then
         local view = guidm.Viewport.get()
         local x, y = (view.x1 + view.x2) // 2, (view.y1 + view.y2) // 2
-        here = df.weather_type[dfhack.maps.getCurrentWeather(x, y, view.z)]
+        here = df.weather_type[grass.ground_weather(x, y, view.z)]   -- (GROUND WEATHER)
     end
     print(('detailed_weather: weather %s; ground %s (temperature %s); weather in view: %s'):format(
         module.force, module.ground_mode, ground.forced_celsius and (ground.forced_celsius .. ' C, forced') or 'the game\'s',
         here))
     print('  wind: ' .. wind.describe())
     print('  rain and snow: ' .. precipitation.describe())
-    print('  textures: ' .. grass.describe_textures())
     print(('  overlay: %.2f ms a frame on average, worst %d ms (%s) over %d frames; view moved %d times'):format(
         module.profile.average, module.profile.worst, module.profile.worst_parts, module.profile.frames,
         module.profile.rescans.view_moved or 0))
+    -- STAGE TIMING: each stage's average a frame since last shown, costliest first; untimed is the
+    -- frame's time outside every stage (tile-info is its own overlay, not part of the frame)
+    local frames = math.max(1, module.profile.frames)
+    local stages, inside = {}, 0
+    for name, ms in pairs(module.stage_ms) do
+        stages[#stages + 1] = {name, ms / frames}
+        if name ~= 'tile-info' then inside = inside + ms end
+    end
+    stages[#stages + 1] = {'untimed', math.max(0, (module.profile.precise_ms or 0) - inside) / frames}
+    table.sort(stages, function(a, b) return a[2] > b[2] end)
+    local parts = {}
+    for _, st in ipairs(stages) do parts[#parts + 1] = ('%s %.2f'):format(st[1], st[2]) end
+    print(('  stages, ms a frame on average: %.2f in all; %s'):format((module.profile.precise_ms or 0) / frames,
+        table.concat(parts, ', ')))
+    for k in pairs(module.stage_ms) do module.stage_ms[k] = nil end
+    module.profile.precise_ms = 0
     module.profile.worst, module.profile.worst_parts, module.profile.frames, module.profile.rescans = 0, '', 0, {}
-    print(('  fog %s (at the fort now: %s), drawing %.2f ms a frame'):format(module.fog_mode,
-        dfhack.isMapLoaded() and df.fog_type[fort_world_tile().clouds.fog] or '-', module.fog_ms))
+    print(('  fog %s (at the fort now: %s), %s'):format(module.fog_mode,
+        dfhack.isMapLoaded() and df.fog_type[fort_world_tile().clouds.fog] or '-',
+        native.wfog_running() and 'drawn by the hook DLL (detailed_weather native)' or ('drawing %.2f ms a frame'):format(module.fog_ms)))
     print(('  rescans (4 a second): rain %.1f ms, fog %.1f ms'):format(module.scan_ms.rain, module.scan_ms.fog))
     -- the shared time for planning and making textures (work_time.lua), since the last `details`
     local work = work_time.stats
@@ -1282,13 +1525,106 @@ local function show_details()
     print('  shade ' .. shade.describe())
     print('  spatter in the grass ' .. spatter.describe())
     print('  murky water ' .. murky.describe())
-    print('  ' .. leaves.describe())
+    print('  ' .. leaves.describe() .. (native.leaves_running() and ' (drawn by the hook DLL: detailed_weather native)' or ''))
     print('  paths ' .. paths.describe())
     print(('  frost %s (temperature %s): planning %.1f ms (once a second, new or due tiles only), drawing %.2f ms a frame'):format(
         module.frost_mode, frost.forced_celsius and (frost.forced_celsius .. ' C, forced') or 'the game\'s',
         frost.timing.plan, frost.timing.apply))
+    -- COUNTS (grungeisdead's copy): what frost baked and why since last shown (frost.lua)
+    local fc, parts = frost.counts or {}, {}
+    for _, k in ipairs({'ramp bakes', 'crack bakes', 'other bakes', 'waited', 'new_base', 'ramp textures seen', 'clears'}) do
+        parts[#parts + 1] = ('%s %d'):format(k, fc[k] or 0)
+    end
+    print(('  frost counts: %s; %d baked textures kept'):format(table.concat(parts, ', '), frost.baked_count or 0))
+    -- (grungeisdead's copy, 2026-11-17) what the texture under the ramps changed from and to (frost.lua)
+    local bases = {}
+    for k, v in pairs(fc) do
+        if type(k) == 'string' and k:find('^new base: ') then bases[#bases + 1] = ('%s %d'):format(k:sub(11), v) end
+    end
+    table.sort(bases)
+    if #bases > 0 then print('  frost new bases: ' .. table.concat(bases, '; ')) end
+    -- (grungeisdead's copy, 2026-11-17) the ramps' waits by what showed meanwhile, the bakes made ahead
+    -- for the next look, and each bake's cost (frost.lua: WAITS BY WHAT SHOWED, THE NEXT LOOK AHEAD,
+    -- BAKE COST)
+    local waits = {}
+    for k, v in pairs(fc) do
+        if type(k) == 'string' and k:find('^ramp waits: ') then waits[#waits + 1] = ('%s %d'):format(k:sub(13), v) end
+    end
+    table.sort(waits)
+    print(('  frost ramp waits: %s; baked ahead for the next look %d'):format(
+        #waits > 0 and table.concat(waits, '; ') or 'none', fc['baked ahead'] or 0))
+    local bm = frost.bake_ms
+    if bm and bm.n > 0 then
+        print(('  frost bake cost, %d bakes: %.2f ms each (redrawing %.2f, making the texture %.2f)'):format(
+            bm.n, (bm.bake + bm.make) / bm.n, bm.bake / bm.n, bm.make / bm.n))
+        bm.n, bm.bake, bm.make = 0, 0, 0
+    end
+    -- (grungeisdead's copy, 2026-11-17) the new bases sorted, and the ramps left showing one of colour's
+    -- copies (frost.lua: NEW BASES SORTED, ALREADY IN THE LOOK)
+    local nb = {}
+    for k, v in pairs(fc) do
+        if type(k) == 'string' and k:find('^nb ') then nb[#nb + 1] = ('%s %d'):format(k:sub(4), v) end
+    end
+    table.sort(nb)
+    if #nb > 0 then print('  frost new bases sorted: ' .. table.concat(nb, '; ')) end
+    print(('  frost ramps showing a copy already in the look, left as they are: %d'):format(
+        fc['ramps showing a copy already in the look'] or 0))
+    -- (grungeisdead's copy, 2026-11-17) frost.lua: LEVELS THE GAME DRAWS, NOT DRAWN YET, LEVELS BELOW ON A MOVE
+    print(('  frost tiles left alone: on levels the game isn\'t drawing %d; the game hadn\'t drawn yet %d; below, kept for the frame of a move %d'):format(
+        fc['tiles on levels the game isn\'t drawing'] or 0, fc['tiles the game hadn\'t drawn yet'] or 0,
+        fc['tiles below kept for the frame of a move'] or 0))
+    for k in pairs(fc) do if k ~= 'ramp_bases' then fc[k] = nil end end
+    fc['ramp textures seen'] = nil
+    -- COUNTS: why the trees', shrubs', boulders' and buildings' copies were made since last shown
+    -- (colour.lua's own screen_counts, which only its profiling tool printed)
+    local sc, list = colour.screen_counts or {}, {}
+    for k, n in pairs(sc) do if k:find('^copies') then list[#list + 1] = ('%s %d'):format(k, n) end end
+    table.sort(list)
+    print('  screen copies: ' .. (#list > 0 and table.concat(list, '; ') or 'none'))
+    for k in pairs(sc) do if k:find('^copies') then sc[k] = nil end end
+    -- COPY TIMING: each copy's cost on average, by part (colour.lua's redrawn_copy)
+    local cm = colour.copy_ms
+    if cm and cm.n > 0 then
+        print(('  copy cost, %d copies: %.2f ms each (reading %.2f, redrawing %.2f, making the texture %.2f)'):format(
+            cm.n, (cm.read + cm.redraw + cm.make) / cm.n, cm.read / cm.n, cm.redraw / cm.n, cm.make / cm.n))
+        cm.n, cm.read, cm.redraw, cm.make = 0, 0, 0, 0
+    end
     print(('  ramps %s: planning %.1f ms (4 times a second, new or due tiles only), drawing %.2f ms a frame'):format(
         module.ramps_mode, snow_ramps.timing.plan, snow_ramps.timing.apply))
+    -- (grungeisdead's copy, 2026-11-17) snow_ramps.lua: UNDRAWN CELLS, STILL OURS and HELD, what the
+    -- snow kept, held and let go since last shown
+    local nc = snow_ramps.counts or {}
+    print(('  snow records: %d frames the view moved; made for tiles with none %d; taken from another level %d; let go %d; kept on the frame of a move %d; left for a frame %d (cell not drawn yet), %d (another texture of ours there); ramps seen under a new number %d'):format(
+        nc['frames the view moved'] or 0, nc['records made for tiles with none'] or 0,
+        nc['records taken from another level'] or 0, nc['records let go'] or 0,
+        nc['records kept for the frame of a move'] or 0, nc['records left for a cell the game hadn\'t drawn yet'] or 0,
+        nc['records left for a frame: another texture of ours there'] or 0, nc['ramps seen under a new number'] or 0))
+    -- (grungeisdead's copy, 2026-11-17) snow_ramps.lua: ANY FULL PIECE
+    print(('  snow floors drawn over another of the game\'s full pieces: %d'):format(nc['floors over another full piece'] or 0))
+    print(('  snow held: cells still drawn from before %d; tiles held %d (cell still showed earlier drawing), %d (cell not drawn yet), %d (snowy, the game\'s snow not drawn there yet), %d (below, the frame of a move); held tiles worked out once drawn %d'):format(
+        nc['cells still drawn from before'] or 0, nc['tiles left: their cell still showed earlier drawing'] or 0,
+        nc['tiles left for a cell the game hadn\'t drawn yet'] or 0, nc['tiles left: snowy, the game\'s snow not drawn there yet'] or 0,
+        nc['tiles below left for the frame of a move'] or 0, nc['held tiles worked out once drawn'] or 0))
+    -- (grungeisdead's copy, 2026-11-17) snow_ramps.lua: KEEP THE VIEW'S, how much the snow keeps, and the
+    -- memory of DFHack's Lua (all its scripts, the snow's records among them)
+    print(('  snow kept: %d records, %d tiles worked out; past their most %d times (records), %d (tiles), all but the view\'s let go; Lua\'s memory %.0f MB'):format(
+        snow_ramps.drawn_count or 0, snow_ramps.remembered_count or 0, nc['records past their most'] or 0,
+        nc['worked-out tiles past their most'] or 0, collectgarbage('count') / 1024))
+    -- (grungeisdead's copy, 2026-11-17) grass.lua: PIXELS KEPT, about 136 KB a texture (measured, Lua 5.3)
+    print('  textures: ' .. grass.describe_textures())
+    for k in pairs(nc) do nc[k] = nil end
+    -- (grungeisdead's copy, 2026-11-17) snow_ramps.lua: COSTS, the time a tile took to work out
+    local sc = snow_ramps.costs or {}
+    local plan_n, work_n = sc.plan_n or 0, sc.work_n or 0
+    print(('  snow costs: %d tiles planned, %.1f us each (with any working out); %d of them worked out from the map, %.1f us each'):format(
+        plan_n, plan_n > 0 and (sc.plan_s or 0) / plan_n * 1e6 or 0, work_n, work_n > 0 and (sc.work_s or 0) / work_n * 1e6 or 0))
+    -- (grungeisdead's copy, 2026-11-17) snow_ramps.lua: LEVELS SHARED, tiles new to a level tried against
+    -- another level's records
+    local tries = sc.adopt_tries or 0
+    print(('  snow from other levels: %d tiles new to a level tried, %d took another level\'s record, %.1f us a try'):format(
+        tries, sc.adopt_n or 0, tries > 0 and (sc.adopt_s or 0) / tries * 1e6 or 0))
+    sc.plan_n, sc.plan_s, sc.work_n, sc.work_s = 0, 0, 0, 0
+    sc.adopt_tries, sc.adopt_n, sc.adopt_s = 0, 0, 0
     print(('  ground: planning %.1f ms (4 times a second, new or due tiles only), drawing %.2f ms a frame, %d textures baked'):format(
         ground.timing.plan, ground.timing.apply, ground.baked_count))
 end

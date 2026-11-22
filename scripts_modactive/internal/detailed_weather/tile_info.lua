@@ -160,7 +160,8 @@ local function weather_line(pos)
         local kind = main.force
         falling = precipitation.FALLING[kind][precipitation.level(kind, true)] .. ' (forced)'
     elseif main.force ~= 'off' then
-        local w = dfhack.maps.getCurrentWeather(pos)
+        -- (GROUND WEATHER, grass.lua: where the rain lands below the tile, not open air's own biome)
+        local w = script_named('internal/detailed_weather/grass').ground_weather(pos.x, pos.y, pos.z)
         local kind = w == df.weather_type.Rain and 'rain' or w == df.weather_type.Snow and 'snow'
         if kind then falling = precipitation.FALLING[kind][precipitation.level(kind)] end
     end

@@ -24,10 +24,11 @@
 -- comes on over a few days and doesn't start at full strength. (A game day passes in about twelve
 -- seconds at normal speed, and spells of rain last from days to weeks; a level every two hours,
 -- as it first was, went from nothing to heavy rain in two seconds: Poss. How long a spell has
--- lasted isn't saved: a fort loaded in the rain builds up again.)
+-- lasted is kept in the save: THE SPELL SAVED, below.)
 --@ module = true
 
 local wind = reqscript('internal/detailed_weather/wind')
+local grass = reqscript('internal/detailed_weather/grass')   -- (GROUND WEATHER)
 
 LIGHTEST, HARDEST = 1, 4
 local HEAVY = 3   -- as hard as it gets without wind
@@ -51,6 +52,33 @@ local TICKS_PER_YEAR = 403200
 
 forced = forced or {}    -- `detailed_weather rain N` / `snow N`: a level for each, for testing
 spell = spell or nil     -- the spell of rain or snow now: {started =, dry_since =} in game ticks
+
+-- THE SPELL SAVED (grungeisdead's copy, 2026-11-20). The spell lived only in this script, so a fort
+-- loaded in the rain started again at drizzle and built up a level a game day (in play: no rain seen
+-- in a minute paused, as no ticks pass, and heavy rain only some 25 s after unpausing; the drizzle
+-- sheet has something drawn in 26% of its tiles). It's now kept in the fort's own DFHack data
+-- (dfhack.persistent site data: held in memory, written into the save when the game saves), saved
+-- whenever it changes and read back at the first look after a fort loads. Both times are absolute game
+-- ticks (now_ticks), so they mean the same after a load. Where there is no site to keep it in
+-- (adventure mode), it goes unsaved as before.
+local SPELL_KEY = 'detailed_weather_spell'
+spell_loaded = spell_loaded or false   -- read back from the fort's data yet (forget empties it)
+local function load_spell()
+    spell_loaded = true
+    local ok, saved = pcall(dfhack.persistent.getSiteData, SPELL_KEY)
+    if ok and type(saved) == 'table' and type(saved.started) == 'number' then
+        spell = {started = saved.started, dry_since = type(saved.dry_since) == 'number' and saved.dry_since or nil}
+    end
+end
+local function save_spell()
+    pcall(function()
+        if spell then
+            dfhack.persistent.saveSiteData(SPELL_KEY, {started = spell.started, dry_since = spell.dry_since})
+        else
+            dfhack.persistent.deleteSiteData(SPELL_KEY)
+        end
+    end)
+end
 
 local function fort_clouds()
     local map = df.global.world.map
@@ -109,7 +137,8 @@ local function falling()
         for j = 0, SAMPLES - 1 do
             local x = math.floor((i + 0.5) * map.x_count / SAMPLES)
             local y = math.floor((j + 0.5) * map.y_count / SAMPLES)
-            local weather = dfhack.maps.getCurrentWeather(x, y, sky)
+            -- (GROUND WEATHER, grass.lua: where the rain lands, not the sky's own biome)
+            local weather = grass.ground_weather(x, y, sky)
             if weather == df.weather_type.Rain or weather == df.weather_type.Snow then falling_now = true end
         end
     end
@@ -120,14 +149,20 @@ end
 -- ends once the map has been seen dry for SPELL_GAP_TICKS; time nobody was looking (the overlay
 -- isn't drawn behind a full-screen menu) counts as part of the spell if it's still falling after.
 local function spell_ticks()
+    if not spell_loaded then load_spell() end   -- (THE SPELL SAVED)
     local now = now_ticks()
     if not falling() then
-        if spell and not spell.dry_since then spell.dry_since = now end
+        if spell and not spell.dry_since then spell.dry_since = now save_spell() end
         return 0
     end
     local ended = spell and spell.dry_since and now - spell.dry_since > SPELL_GAP_TICKS
-    if not spell or ended or now < spell.started then spell = {started = now} end
-    spell.dry_since = nil
+    if not spell or ended or now < spell.started then
+        spell = {started = now}
+        save_spell()
+    elseif spell.dry_since then
+        spell.dry_since = nil   -- (back within the gap: the same spell carrying on)
+        save_spell()
+    end
     return now - spell.started
 end
 
@@ -148,7 +183,8 @@ function level(kind, full_strength)
     return math.min(wanted, built, HARDEST)
 end
 
-function forget() spell = nil end
+-- A world unloading: the next fort's spell is read from its own data (THE SPELL SAVED).
+function forget() spell, spell_loaded = nil, false end
 
 function describe()
     local _, _, strength = wind.get()

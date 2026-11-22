@@ -6,6 +6,8 @@
 -- Not saved: a loaded fort starts at its climate's.
 --@ module = true
 
+local grass = reqscript('internal/detailed_weather/grass')   -- (GROUND WEATHER)
+
 local RAIN_SOAK_DAYS = 3      -- rain takes it from dry to wet in about this (a shower only darkens it a step)
 local DRY_DAYS = 10           -- and it dries back over about this, at mild temperatures
 local HOT_DRYING = 1.0        -- in full heat it dries this much faster again
@@ -46,7 +48,8 @@ local function raining()
         for j = 0, RAIN_SAMPLES - 1 do
             local x = math.floor((i + 0.5) * map.x_count / RAIN_SAMPLES)
             local y = math.floor((j + 0.5) * map.y_count / RAIN_SAMPLES)
-            if dfhack.maps.getCurrentWeather(x, y, z) == df.weather_type.Rain then wet = wet + 1 end
+            -- (GROUND WEATHER, grass.lua: where the rain lands, not the sky's own biome)
+            if grass.ground_weather(x, y, z) == df.weather_type.Rain then wet = wet + 1 end
         end
     end
     rain_share = wet / (RAIN_SAMPLES * RAIN_SAMPLES)

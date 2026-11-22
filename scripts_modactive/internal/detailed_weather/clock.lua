@@ -18,3 +18,11 @@ local function since_start_ms() return math.floor(os.clock() * 1000) end
 local on_windows = dfhack.getOSType and dfhack.getOSType() == 'windows'
 
 ms = on_windows and since_start_ms or dfhack.getTickCount
+
+-- The time in seconds, with a fraction where the system gives one, for timing short stretches of
+-- work and adding them up (a stage's average cost a frame). On Windows os.clock() is that. Elsewhere
+-- it's the whole-millisecond clock above: a single short stretch reads as 0 or 1 ms, but the
+-- stretches' sum over many frames comes out right.
+local function tick_seconds() return dfhack.getTickCount() / 1000 end
+
+s = on_windows and os.clock or tick_seconds

@@ -214,6 +214,9 @@ local SOIL = {dirt = true, sand = true}
 
 -- Per class, the look's colour change as a function of (r, g, b) -> r, g, b.
 local recolour_cache = {}
+-- NATIVE COPIES (grungeisdead's copy, 2026-11-18): the same change's numbers, by the same key
+-- (recolour_numbers, below)
+local recolour_params = {}
 function recolourer(class, look)
     local key = class .. ':' .. look.temperature .. ':' .. look.wet
     local f = recolour_cache[key]
@@ -233,6 +236,8 @@ function recolourer(class, look)
             return nr * dark, ng * dark, nb * dark
         end
         recolour_cache[key] = f
+        -- (NATIVE REDRAW: ice's numbers too, for native_numbers)
+        recolour_params[key] = {ice = true, m = m, k = k, dark = dark}
         return f
     elseif class == 'grass' then
         m = matrix(DRY_HUE + (WET_HUE - DRY_HUE) * w, (1 + sat_t) * extra - 1)
@@ -248,6 +253,7 @@ function recolourer(class, look)
                                  1 + (lean_from[3] - 1) * amount}
     local dark = 1 - w * WET_DARK
     local lighten = EXTRA_LIGHTNESS * (1 - 2 * w)
+    recolour_params[key] = {m = m, soil = soil, lean = lean, dark = dark, lighten = lighten}
     local function balance(r, g, b, gains)
         local before = lum_of(r, g, b)
         local nr, ng, nb = r * gains[1], g * gains[2], b * gains[3]
@@ -268,6 +274,22 @@ function recolourer(class, look)
     recolour_cache[key] = f
     return f
 end
+
+-- NATIVE COPIES (grungeisdead's copy, 2026-11-18): the numbers behind a class's colour change for a
+-- look, for the hook DLL, which paints colour.lua's per-tile copies with them the way the function
+-- above changes each pixel (detailed_weather_dll.cpp: PAINTING): {m = the matrix (9, by rows), soil
+-- = gains or nil, lean = gains or nil, dark, lighten}. nil for ice, whose change is another sum.
+function recolour_numbers(class, look)
+    recolourer(class, look)
+    return recolour_params[class .. ':' .. look.temperature .. ':' .. look.wet]
+end
+
+-- Whether a class's copy is its colour change alone (redraw's COLOUR ONLY, BY COLOUR): no dry or wet
+-- effects, so the DLL can paint it.
+function colour_only_class(class)
+    return not (class == 'grass' or GROUND[class] or class == 'ice')
+end
+
 
 ----------------------------------------------------------------------------------------------
 -- Dry
@@ -314,12 +336,14 @@ local function deepen(r, g, b, share, dark, towards)
 end
 
 local grain   -- sand's grain rank per pixel (0-1), from art/heat_patterns.png's first piece
+local grain_texpos   -- (NATIVE REDRAW) that piece's texture, whose pixels the DLL reads
 local art_dir = (debug.getinfo(1, 'S').source:match('^@(.*[/\\])') or '') .. '../../../art/'
 local function sand_grain()
     if grain then return grain end
     grain = {}
     local handles = dfhack.textures.loadTileset(art_dir .. 'heat_patterns.png', TILE, TILE, true)
-    local px = grass.pixels_of(dfhack.textures.getTexposByHandle(handles[1]))
+    grain_texpos = dfhack.textures.getTexposByHandle(handles[1])
+    local px = grass.pixels_of(grain_texpos)
     for n = 1, N do grain[n] = px and px[n][3] / 255 or 0.5 end
     return grain
 end
@@ -456,15 +480,80 @@ local function wet(r, g, b, kind, weather, amount)
     end
 end
 
+-- NATIVE REDRAW (grungeisdead's copy, 2026-11-18): everything the hook DLL needs to redraw a texture of
+-- a class for a look as redraw does with its effects (detailed_weather_dll.cpp: THE FULL REDRAW): the
+-- colour change's numbers, and cls (1 grass, 2 dirt, 3 sand, 4 stone, 5 pebbles, 6 ice; 0: colour only),
+-- dryness, wet (the wet effect's amount, 0 for none), weather (0 cold, 1 mild, 2 hot), thaw (ice), grain
+-- (sand: the address of the grain piece's pixels, or nil). nil if there are no numbers for it.
+local CLASS_IDS = {grass = 1, dirt = 2, sand = 3, stone = 4, pebbles = 5, ice = 6}
+local WEATHER_IDS = {cold = 0, mild = 1, hot = 2}
+function native_numbers(class, look)
+    local p = recolour_numbers(class, look)
+    if not p then return nil end
+    local t, w = shares(look)
+    local out = {m = p.m, soil = p.soil, lean = p.lean, dark = p.dark, lighten = p.lighten,
+                 cls = 0, dryness = 0, wet = 0, weather = 1, thaw = 0}
+    if p.ice then
+        out.ice_k, out.ice_dark, out.dark, out.lighten = p.k, p.dark, 1, 0
+        out.cls = CLASS_IDS.ice
+        out.thaw = math.max(0, math.min(1, (t - ICE_THAW_FROM) / -ICE_THAW_FROM))
+    elseif class == 'grass' or GROUND[class] then
+        out.cls = CLASS_IDS[class]
+        out.dryness = w < 0.5 and 1 - 2 * w or 0
+        out.wet = w > 0.5 and (w - 0.5) * 2 or 0
+        out.weather = WEATHER_IDS[weather_of(t)]
+        if class == 'sand' and out.dryness > 0 then
+            sand_grain()
+            out.grain = grain_texpos and grass.original_address(grain_texpos) or nil
+        end
+    end
+    return out
+end
+
 ----------------------------------------------------------------------------------------------
 -- A whole texture
 ----------------------------------------------------------------------------------------------
+
+-- COLOUR ONLY, BY COLOUR (grungeisdead's copy, 2026-11-16). With no dry, wet or ice effects to
+-- apply (trees, shrubs, boulders, buildings, wood: every class but grass, bare ground and ice, and
+-- any class asked for colour only), a pixel's new colour depends on its own colour alone. It was
+-- worked out for all 1024 pixels of every picture: 0.75 of the 0.82 ms each copy of a tree's part
+-- took (measured 2026-11-16), so a level of new trees filled in a few pictures a frame. A picture
+-- has a few dozen colours, so each is worked out once per class and look and kept: the same
+-- numbers, rounded and clamped as below. [class:temperature:wet] = {[rgb] = packed bgr}.
+local colour_memo = {}
+local function colour_only(px, class, look)
+    local key = class .. ':' .. look.temperature .. ':' .. look.wet
+    local memo = colour_memo[key]
+    if not memo then memo = {} colour_memo[key] = memo end
+    local recolour = recolourer(class, look)
+    local out = {}
+    for n = 1, N do
+        local p = px[n]
+        local rgb = (p[3] << 16) | (p[2] << 8) | p[1]
+        local v = memo[rgb]
+        if not v then
+            local nr, ng, nb = recolour(p[1], p[2], p[3])
+            nr = nr < 0 and 0 or nr > 255 and 255 or math.floor(nr + 0.5)
+            ng = ng < 0 and 0 or ng > 255 and 255 or math.floor(ng + 0.5)
+            nb = nb < 0 and 0 or nb > 255 and 255 or math.floor(nb + 0.5)
+            v = (nb << 16) | (ng << 8) | nr
+            memo[rgb] = v
+        end
+        out[n] = (p[4] << 24) | v
+    end
+    return out
+end
 
 -- The texture's pixels redrawn for the look, packed for dfhack.textures.createTile, or nil.
 -- `effects` false leaves out the dry and wet effects (colour only).
 function redraw(texpos, class, look, effects)
     local px = grass.pixels_of(texpos)
     if not px then return nil end
+    -- COLOUR ONLY, BY COLOUR: nothing below but the colour for these
+    if effects == false or not (class == 'grass' or GROUND[class] or class == 'ice') then
+        return colour_only(px, class, look)
+    end
     local recolour = recolourer(class, look)
     local r, g, b, a = {}, {}, {}, {}
     shown = nil

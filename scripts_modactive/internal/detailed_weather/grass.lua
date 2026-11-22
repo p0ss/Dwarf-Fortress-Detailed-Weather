@@ -186,6 +186,40 @@ dfhack.onStateChange.detailed_weather_blocks = function(event)
     end
 end
 
+----------------------------------------------------------------------------------------------
+-- The weather where rain lands (grungeisdead's copy, 2026-11-18)
+----------------------------------------------------------------------------------------------
+-- GROUND WEATHER. DFHack's getCurrentWeather doesn't read the weather from the tile asked about:
+-- it takes that tile's biome from its map block and reads the biome's cell in the game's 5x5
+-- weather grid (DFHack's library/modules/Maps.cpp). Open air carries biome numbers of its own, so
+-- the same column could read another region's weather: the sky above this fort read region 11,4
+-- (raining) and the ground region 12,5 (dry), seen in play. The wetness sampled the sky and called
+-- the whole map rained on, and the rain was drawn by each block's centre tile on the level in view,
+-- so it came and went in block-sized squares with the level. The weather of (x, y) is now read at
+-- the first tile that isn't open air, at or below z (the top of the map if z is nil), where the
+-- rain lands.
+local open_shape = {}   -- tiletype -> whether it's open air (looked up once each)
+local function is_open(tiletype)
+    local open = open_shape[tiletype]
+    if open == nil then
+        local shape = df.tiletype.attrs[tiletype].shape
+        open = shape == df.tiletype_shape.EMPTY or shape == df.tiletype_shape.RAMP_TOP or shape == df.tiletype_shape.NONE
+        open_shape[tiletype] = open
+    end
+    return open
+end
+function ground_weather(x, y, z)
+    local map = df.global.world.map
+    local top = map.z_count - 1
+    z = (z and z < top) and z or top
+    while z > 0 do
+        local tiletype = dfhack.maps.getTileType(x, y, z)
+        if tiletype and not is_open(tiletype) then break end
+        z = z - 1
+    end
+    return dfhack.maps.getCurrentWeather(x, y, z)
+end
+
 -- The snow on a tile (0-255; the game draws it from about 100). Each block's snow is read in one go
 -- (its events walked once, not once per tile) and kept for SNOW_KEPT_MS: snow comes and goes slowly.
 local SNOW_KEPT_MS = 10000
@@ -304,30 +338,172 @@ local function unpack_pixels(packed)
     return px
 end
 
+-- A texture's kept pixels forgotten (its picture is gone or changed).
+local function forget_pixels(texpos)
+    packed_pixels[texpos], recent_pixels[texpos], older_pixels[texpos] = nil, nil, nil
+end
+
+-- WHOLE PIXELS (grungeisdead's copy, 2026-11-16): each pixel is read as one uint32 and split into
+-- its bytes here, not read a byte at a time. Every read through DFHack's bridge costs about the
+-- same whatever its size, so a picture was 4096 reads and is now 1024 (stone-tint measured the
+-- same change four times cheaper). Little-endian, so the uint32 is (a << 24) | (b << 16) |
+-- (g << 8) | r: the same R, G, B, A bytes as before. Every redraw starts with a read: frost's
+-- ramps, the snow, the colour's copies, the grass's frames. The surface's pixels as uint32s, the
+-- row length in pixels, and the pixels' address, or nil.
 local function surface_of(texpos)
     local surface = df.global.enabler.textures.raws[texpos]
     if not surface then return nil end
     local ints = df.reinterpret_cast('int32_t', surface)
     local w, h, pitch = ints:_displace(4)[0], ints:_displace(5)[0], ints:_displace(6)[0]
-    if w ~= TILE or h ~= TILE then return nil end
+    if w ~= TILE or h ~= TILE or pitch % 4 ~= 0 then return nil end
     local address = df.reinterpret_cast('uint64_t', surface):_displace(4)[0]
-    return df.reinterpret_cast('uint8_t', address), pitch, address
+    return df.reinterpret_cast('uint32_t', address), pitch // 4, address
 end
 
-local function signature(bytes, pitch)
+local function signature(words, row)
     local sum = 0
     for _, n in ipairs(SIGNATURE_POINTS) do
-        local o = (n // TILE) * pitch + (n % TILE) * 4
-        sum = (sum * 31 + bytes[o] + bytes[o + 1] * 7 + bytes[o + 2] * 13 + bytes[o + 3] * 17) % 2147483647
+        sum = (sum * 31 + words[(n // TILE) * row + n % TILE]) % 2147483647
     end
     return sum
 end
 
+----------------------------------------------------------------------------------------------
+-- Repainting the game's own pictures (grungeisdead's copy, 2026-11-16)
+----------------------------------------------------------------------------------------------
+-- Why: after a zoom the game draws its own tree pictures again for 3 to 6 frames AFTER every
+-- overlay has drawn (zz-zoom-recorder: the buffer held the copies straight after colour.lua's
+-- per-tile pass, the frame as shown held the game's own), so a per-tile swap can't hold through
+-- it, and the trees' trunks flickered to the game's colours on fast zooms. No Lua runs later in
+-- the frame. So the game's own picture is given the copy's pixels as well: whatever number the
+-- game writes then shows the look. The game draws from a copy it keeps and reads a texture's
+-- pixels again only on a zoom (dw-inplace-probe: a picture repainted, or pointed at another, showed
+-- only after a zoom, and stayed until the next one even when put back), which is exactly when the
+-- per-tile swap can't hold; the rest of the time the swap shows the same colours.
+--
+-- A record per repainted texture: the surface it was written to (its address and its pixels'
+-- address), the game's own pixels saved, and a signature of what was written. Before any write and
+-- on every read the record is checked against the texture as it is now: if the game has freed or
+-- remade the picture (another surface, or other pixels than were written), the record is dropped
+-- and nothing is written. When a world unloads the game frees its textures, so every record is
+-- dropped then without writing (onStateChange below).
+_G.detailed_weather_repainted = _G.detailed_weather_repainted or {}
+repainted = _G.detailed_weather_repainted   -- texpos -> {surface, pixels, saved, base, written}
+local ROW_BYTES = TILE * 4
+
+-- The address a lightuserdata points at (df.sizeof gives nil, address for one).
+local function address_of(ptr)
+    if not ptr then return nil end
+    local _, address = df.sizeof(ptr)
+    return address
+end
+
+-- Whether a record still matches its texture: the same surface, the same pixels' memory, and the
+-- pixels it was given still there.
+function still_repainted(texpos, r)
+    local words, row, address = surface_of(texpos)
+    if not words or address ~= r.pixels then return false end
+    if address_of(df.global.enabler.textures.raws[texpos]) ~= r.surface then return false end
+    return signature(words, row) == r.written
+end
+
+-- A record dropped without writing (its memory may not be the game's picture any more).
+function forget_repaint(texpos)
+    local r = repainted[texpos]
+    if r then
+        df.delete(r.saved)
+        repainted[texpos] = nil
+        forget_pixels(texpos)
+    end
+end
+
+-- Gives the game's texture `texpos` the pixels of `copy` (a Detailed Weather copy of it), saving
+-- the game's own the first time. Returns true if written.
+function repaint(texpos, copy)
+    local words, row, address = surface_of(texpos)
+    local copy_words, copy_row, copy_address = surface_of(copy)
+    if not words or not copy_words then return false end
+    local r = repainted[texpos]
+    if r and not still_repainted(texpos, r) then forget_repaint(texpos) r = nil end
+    if not r then
+        -- the game's own pixels, saved (row by row: the surface's rows may be padded)
+        local saved = df.new('uint32_t', TILE * TILE)
+        local _, base = df.sizeof(saved)
+        for y = 0, TILE - 1 do dfhack.internal.memmove(base + y * ROW_BYTES, address + y * row * 4, ROW_BYTES) end
+        r = {surface = address_of(df.global.enabler.textures.raws[texpos]), pixels = address, saved = saved, base = base}
+        repainted[texpos] = r
+    end
+    for y = 0, TILE - 1 do dfhack.internal.memmove(address + y * row * 4, copy_address + y * copy_row * 4, ROW_BYTES) end
+    r.written = signature(words, row)
+    return true
+end
+
+-- The game's own pixels put back into one texture (if it's still the picture written to).
+function unpaint(texpos)
+    local r = repainted[texpos]
+    if not r then return end
+    if still_repainted(texpos, r) then
+        local _, row, pixels = surface_of(texpos)
+        for y = 0, TILE - 1 do dfhack.internal.memmove(pixels + y * row * 4, r.base + y * ROW_BYTES, ROW_BYTES) end
+    end
+    forget_repaint(texpos)
+end
+
+-- Every repainted texture put back (trees or colour turned off, the screen's copies let go).
+function unpaint_all()
+    for texpos in pairs(repainted) do unpaint(texpos) end
+end
+
+-- How many textures are repainted now (`detailed_weather`).
+function repainted_count()
+    local n = 0
+    for _ in pairs(repainted) do n = n + 1 end
+    return n
+end
+
+-- A world or map unloading: the game frees its textures, so every record is dropped unwritten.
+dfhack.onStateChange.detailed_weather_repainted = function(event)
+    if event == SC_MAP_UNLOADED or event == SC_WORLD_UNLOADED then
+        for texpos in pairs(repainted) do forget_repaint(texpos) end
+    end
+end
+
+-- REPAINTED PICTURES (grungeisdead's copy, 2026-11-16). Some of the game's own tree pictures have
+-- their pixels overwritten with Detailed Weather's colours (repaint, below). Every read of a
+-- texture's pixels must still see the game's own picture, or a copy would be coloured twice and a
+-- change of picture would go unseen: the reads go through here, which gives the saved original
+-- for a repainted texture. Returns the pixels as uint32s, the row length in pixels, and the
+-- address they were read from (the live surface's, for the pixel cache), or nil.
+function original_words(texpos)
+    local r = repainted[texpos]
+    if r then
+        if still_repainted(texpos, r) then return r.saved, TILE, r.pixels end
+        forget_repaint(texpos)
+    end
+    return surface_of(texpos)
+end
+
+-- (grungeisdead's copy, 2026-11-16) The address of a texture's own 32x32 pixels as one unbroken run
+-- of 4096 bytes, for comparing whole pictures with one memcmp (colour.lua: PICTURES BY MEMCMP):
+-- the saved pixels of a repainted texture, else its surface's own when its rows aren't padded.
+-- nil when neither is so (the caller falls back to reading the pixels).
+function original_address(texpos)
+    if not texpos or texpos <= 0 then return nil end
+    local r = repainted[texpos]
+    if r then
+        if still_repainted(texpos, r) then return r.base end
+        forget_repaint(texpos)
+    end
+    local words, row, address = surface_of(texpos)
+    if words and row == TILE then return address end
+    return nil
+end
+
 function pixels_of(texpos)
     if not texpos or texpos <= 0 then return nil end
-    local bytes, pitch, address = surface_of(texpos)
-    if not bytes then packed_pixels[texpos] = nil return nil end
-    local sig = signature(bytes, pitch)
+    local words, row, address = original_words(texpos)
+    if not words then forget_pixels(texpos) return nil end
+    local sig = signature(words, row)
     local entry = packed_pixels[texpos]
     if entry and entry.address == address and entry.sig == sig then
         local recent = recent_pixels[texpos]
@@ -344,8 +520,8 @@ function pixels_of(texpos)
     local px = {}
     for y = 0, TILE - 1 do
         for x = 0, TILE - 1 do
-            local o = y * pitch + x * 4
-            px[#px + 1] = {bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]}
+            local v = words[y * row + x]
+            px[#px + 1] = {v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, v >> 24}
         end
     end
     entry = {packed = pack_pixels(px), address = address, sig = sig}

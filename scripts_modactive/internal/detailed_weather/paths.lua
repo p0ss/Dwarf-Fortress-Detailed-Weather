@@ -433,13 +433,14 @@ local function continue_plan(q, viewport, port, depth, now, budget_ms)
                 for _, e in ipairs(entries) do
                     local x, y = e[1], e[2]
                     if x >= viewport.x1 and x <= x2 and y >= viewport.y1 and y <= y2 and (depth == 0 or shows(x, y)) then
-                        cells[#cells + 1] = {(x - viewport.x1) * dim_y + (y - viewport.y1), e[3], e[4], e[5]}
+                        -- {x, y, track, wash, wear}: by map position (PLANS BY MAP POSITION, apply)
+                        cells[#cells + 1] = {x, y, e[3], e[4], e[5]}
                     end
                     for _, edge in ipairs(e[6] or {}) do
                         local ex, ey = edge[1], edge[2]
                         if ex >= viewport.x1 and ex <= x2 and ey >= viewport.y1 and ey <= y2 and (depth == 0 or shows(ex, ey)) then
-                            local i = (ex - viewport.x1) * dim_y + (ey - viewport.y1)
-                            q.worn_edges[i] = (q.worn_edges[i] or 0) | (0xff << (8 * (edge[3] - 1)))
+                            local k = ex * 4096 + ey   -- (by map position too)
+                            q.worn_edges[k] = (q.worn_edges[k] or 0) | (0xff << (8 * (edge[3] - 1)))
                         end
                     end
                 end
@@ -494,22 +495,33 @@ end
 
 -- Draws one level's plan into its background buffer (looked up afresh: the game swaps each
 -- buffer with its twin every frame), baking new textures while the frame's baking time lasts.
-local function draw(p, port, soil_texpos, state)
+local function draw(p, port, soil_texpos, state, viewport)
     local background = port.screentexpos_background
+    -- (PLANS BY MAP POSITION: a cell's place in the buffer worked out from the view as it's drawn;
+    -- nil for one out of view)
+    local x1, y1, dim_x, dim_y = viewport.x1, viewport.y1, port.dim_x, port.dim_y
+    local function index_of(x, y)
+        local sx, sy = x - x1, y - y1
+        if sx < 0 or sy < 0 or sx >= dim_x or sy >= dim_y then return nil end
+        return sx * dim_y + sy
+    end
     -- grass edges worn off where a track runs onto bare soil
     if next(p.worn_edges or {}) then
         local floor_flag = port.screentexpos_floor_flag
-        for i, mask in pairs(p.worn_edges) do
-            local flag = floor_flag[i]
-            if flag & mask ~= 0 then floor_flag[i] = flag & ~mask end
+        for k, mask in pairs(p.worn_edges) do
+            local i = index_of(k // 4096, k % 4096)
+            if i then
+                local flag = floor_flag[i]
+                if flag & mask ~= 0 then floor_flag[i] = flag & ~mask end
+            end
         end
     end
     for _, cell in ipairs(p.cells) do
-        local i = cell[1]
+        local i = index_of(cell[1], cell[2])
         -- worn grass is flattened: it doesn't lean in the wind (colour.lua), so it's baked upright
-        local base = colour.steady_of(background[i])
+        local base = i and colour.steady_of(background[i]) or 0
         if base > 0 and not made[base] then
-            local key = base .. ':' .. soil_texpos .. ':' .. cell[4]
+            local key = base .. ':' .. soil_texpos .. ':' .. cell[5]
             local texpos = baked[key]
             if texpos == nil then
                 if not state.baking_from then
@@ -517,8 +529,8 @@ local function draw(p, port, soil_texpos, state)
                 end
                 if clock_ms() - state.baking_from < state.bake_ms then
                     if grass.delete_textures and baked_count >= BAKED_MOST then clear_cache() end
-                    local track = cell[2] and track_mask(cell[2][1], cell[2][2])
-                    local px = bake(base, soil_texpos, track, wash_mask(cell[3][1], cell[3][2]))
+                    local track = cell[3] and track_mask(cell[3][1], cell[3][2])
+                    local px = bake(base, soil_texpos, track, wash_mask(cell[4][1], cell[4][2]))
                     local handle = px and dfhack.textures.createTile(px, TILE, TILE)
                     texpos = handle and dfhack.textures.getTexposByHandle(handle) or false
                     baked[key] = texpos
@@ -535,12 +547,59 @@ local function port_at(depth)
     return depth == 0 and df.global.gps.main_viewport or df.global.gps.lower_viewport[depth - 1]
 end
 
+-- NATIVE PATHS (grungeisdead's copy, 2026-11-19, test 15B). With the hook DLL running, it does all the
+-- above (detailed_weather_dll.cpp: PATHS, checked against this file: the same worn tiles and keys, and
+-- the same pixels, bit for bit): it reads the grass, works out each worn tile, paints and swaps it in.
+-- What's left here, called by native.lua: which soil to draw (from the textures the DLL counts on bare
+-- soil in view, as find_soil picks), and where a grass texture's steady picture's pixels are.
+native_paths = native_paths or false   -- native.lua: true while the DLL draws the paths
+native_soil_look, native_soil_gen, native_soil_set = nil, nil, false
+function native_start()
+    native_soil_look, native_soil_gen, native_soil_set = nil, nil, false
+end
+-- Whether the soil should be found again: none yet, a new look, or colour's copies let go.
+function native_soil_wanted()
+    local _, look_key = colour.shown_look()
+    return not native_soil_set or native_soil_look ~= look_key or native_soil_gen ~= colour.copies_generation
+end
+-- The soil's pixels, from the four commonest textures on bare soil in view (most first; 0: none),
+-- as find_soil picks; nil if there's none to draw yet.
+function native_soil(seen)
+    for _, t in ipairs(seen) do
+        if t and t > 0 then
+            -- (dry dirt shows frost.lua's cracked copy: the ground it was made from)
+            local texpos = frost.uncracked(t)
+            if texpos > 0 and not made[texpos] and colour.class_of(colour.original_of(texpos)) == 'dirt' then
+                soil_original = colour.original_of(texpos)
+                break
+            end
+        end
+    end
+    local original = soil_original or any_dirt()
+    if not original then return nil end
+    local copy = colour.copy_of(original)
+    if copy == original and colour.shown_look() then return nil end
+    local address = grass.original_address(copy)
+    if not address then return nil end
+    local _, look_key = colour.shown_look()
+    native_soil_look, native_soil_gen, native_soil_set = look_key, colour.copies_generation, true
+    return address
+end
+-- A grass texture's steady picture's pixels (worn grass is flattened: baked upright, as draw does),
+-- or 0 for nothing drawn on it.
+function native_base(t)
+    local base = colour.steady_of(t)
+    if not base or base <= 0 or made[base] then return 0 end
+    return grass.original_address(base) or 0
+end
+
 plans = plans or {}   -- per depth
 soil, soil_look = soil or nil, soil_look or nil   -- the soil texture, found again when the look changes
 soil_original = soil_original or nil   -- the game's dirt texture last found on screen
 seen_generation = seen_generation or nil   -- colour.copies_generation when the bakes were made
 function apply(viewport)
     if mode ~= 'on' then return end
+    if native_paths then return end   -- (NATIVE PATHS: native.lua does what's left here)
     local now = clock_ms()
     local planning_left = PLAN_MS * allowance
     local _, look_key = colour.shown_look()
@@ -554,11 +613,19 @@ function apply(viewport)
     for depth = 0, MOST_DEPTH do
         local port = port_at(depth)
         local p = plans[depth]
-        if not p or p.x1 ~= viewport.x1 or p.y1 ~= viewport.y1 or p.z ~= viewport.z
-                or p.dim_x ~= port.dim_x or p.dim_y ~= port.dim_y then
-            -- another view: start afresh (the old plan's indexes are wrong here)
+        if not p or p.z ~= viewport.z then
+            -- another level: start afresh
             p = new_plan(viewport, port)
             plans[depth] = p
+        elseif p.x1 ~= viewport.x1 or p.y1 ~= viewport.y1 or p.dim_x ~= port.dim_x or p.dim_y ~= port.dim_y then
+            -- PLANS BY MAP POSITION (grungeisdead's copy, 2026-11-17). A pan or zoom on the same level
+            -- keeps the plan: its cells are by map position, drawn where they are now, and the blocks
+            -- just come into view are added to it. It used to start afresh, and a worn tile in view
+            -- all along vanished until the new plan reached its block, a few frames later (seen in
+            -- play: a grass tile's worn path flickering on every zoom).
+            p.x1, p.y1, p.dim_x, p.dim_y = viewport.x1, viewport.y1, port.dim_x, port.dim_y
+            p.complete, p.open_checked = false, nil
+            p.next = nil   -- (a replacement under way was for the old view; started again when due)
         end
         -- the plan still being built, or (once it's due) its replacement, built alongside while
         -- the current one stays drawn
@@ -575,13 +642,13 @@ function apply(viewport)
             planning_left = planning_left - took
             timing.plan = timing.plan + (took - timing.plan) * 0.2
             if building == p.next and building.complete then
-                p.cells, p.due, p.next = building.cells, building.due, nil
+                p.cells, p.worn_edges, p.due, p.next = building.cells, building.worn_edges, building.due, nil
             end
         end
         if #p.cells > 0 then
             if not soil and depth == 0 then soil = find_soil(port, viewport) end
             local started = clock_ms()
-            if soil then draw(p, port, soil, state) end
+            if soil then draw(p, port, soil, state, viewport) end
             timing.apply = timing.apply + (clock_ms() - started - timing.apply) * 0.05
         end
     end
@@ -598,6 +665,7 @@ function forget_world()
 end
 
 function describe()
+    if native_paths then return mode .. ': drawn by the hook DLL (detailed_weather native)' end
     local shown = 0
     for _, p in pairs(plans) do shown = shown + #p.cells end
     return ('%s: planning %.1f ms (new blocks as the view moves, changed grass), drawing %.2f ms a frame, %d worn tiles showing, %d textures made'):format(

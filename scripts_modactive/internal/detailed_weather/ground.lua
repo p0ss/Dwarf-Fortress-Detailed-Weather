@@ -190,14 +190,13 @@ frame_number = frame_number or 0
 
 function clear_cache()
     remembered, remembered_count = {}, 0
-    for _, entry in pairs(baked) do grass.discard(entry.handle, 'old ground experiment') end
+    for _, entry in pairs(baked) do grass.discard(entry.handle) end
     baked, baked_count = {}, 0
 end
 
 -- As in grass.lua: free the least recently shown once there are too many, keeping anything shown
 -- in the last few frames (its texpos may still be in the buffers the game is about to draw).
 local function trim_cache()
-    -- (nothing is thrown out for the cache being big unless textures are being deleted: grass.lua)
     if not grass.delete_textures or baked_count <= CACHE_LIMIT then return end
     local old = {}
     for key, entry in pairs(baked) do
@@ -206,7 +205,8 @@ local function trim_cache()
     table.sort(old, function(a, b) return a.used < b.used end)
     for n = 1, math.min(#old, baked_count - CACHE_LIMIT * 3 // 4) do
         local entry = baked[old[n].key]
-        if entry.handle then grass.discard(entry.handle, 'old ground experiment') end
+        -- let go, never deleted (grass.lua: NO TEXTURE IS EVER DELETED)
+        if entry.handle then grass.discard(entry.handle) end
         baked[old[n].key] = nil
         baked_count = baked_count - 1
     end

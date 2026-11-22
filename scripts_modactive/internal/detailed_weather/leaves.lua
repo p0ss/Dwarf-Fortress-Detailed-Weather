@@ -398,6 +398,28 @@ function falling_at(pos, strength)
     return ('%s%s %s falling'):format(({'a few ', '', 'many '})[heaviness], name, what)
 end
 
+-- NATIVE LEAVES (grungeisdead's copy, test 15X): while the hook DLL draws the falling leaves and petals
+-- (native.lua: THE FOG AND THE LEAVES DRAWN BY THE DLL), it works out from the map itself which tiles they
+-- fall on, as find_over and decide do here, and draws them as apply does; this file only says which trees
+-- shed and what each is shedding now (falling_from), for detailed_weather.lua to hand over.
+-- Every plant raw that sheds anything: {[raw] = true}
+function shedding_raws()
+    local out = {}
+    for raw in pairs(sheds()) do out[raw] = true end
+    return out
+end
+-- What each tree raw is shedding now: {[raw] = {sheet name, heaviness}}, or nil out of season
+function native_frame(strength)
+    local tick = df.global.cur_year_tick
+    if not in_season(tick) then return nil end
+    local specs = {}
+    for raw in pairs(sheds()) do
+        local name, heaviness = falling_from(raw, tick, strength)
+        if name then specs[raw] = {name, heaviness} end
+    end
+    return specs
+end
+
 function forget_world()
     over, over_seed, over_count, plant_raw, plant_seed, forget_at, shedding, shown.key = {}, {}, 0, {}, {}, 0, nil, nil
     decided = {}
